@@ -5,6 +5,7 @@ import secrets
 import base64
 import json
 
+
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from html import escape
@@ -125,26 +126,6 @@ def get_db():
     return conn
 
 
-def ensure_column(
-    conn,
-    table,
-    column,
-    definition
-):
-
-    existing = {
-        row["name"]
-        for row in conn.execute(
-            f"PRAGMA table_info({table})"
-        ).fetchall()
-    }
-
-    if column not in existing:
-        conn.execute(
-            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
-        )
-
-
 def init_db():
 
     conn = get_db()
@@ -175,14 +156,6 @@ def init_db():
 
             gmail_message_id TEXT,
 
-            message_body TEXT,
-
-            parent_tracking_id TEXT,
-
-            forwarded_to TEXT,
-
-            forwarded_at TEXT,
-
             first_opened_at TEXT,
 
             last_opened_at TEXT,
@@ -202,15 +175,6 @@ def init_db():
             page_visit_count INTEGER NOT NULL DEFAULT 0
         )
     """)
-
-    # --------------------------------------------------------
-    # MIGRATE EXISTING tracker.db
-    # --------------------------------------------------------
-
-    ensure_column(conn, "emails", "message_body", "TEXT")
-    ensure_column(conn, "emails", "parent_tracking_id", "TEXT")
-    ensure_column(conn, "emails", "forwarded_to", "TEXT")
-    ensure_column(conn, "emails", "forwarded_at", "TEXT")
 
     # --------------------------------------------------------
     # ACTIVITY
@@ -822,8 +786,7 @@ def send_one_email(
     service,
     recipient,
     subject,
-    message,
-    parent_tracking_id=None
+    message
 ):
 
     tracking_id = secrets.token_urlsafe(
@@ -884,24 +847,16 @@ def send_one_email(
             recipient,
             subject,
             sent_at,
-            gmail_message_id,
-            message_body,
-            parent_tracking_id,
-            forwarded_to,
-            forwarded_at
+            gmail_message_id
 
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?)
     """, (
         tracking_id,
         recipient,
         subject,
         sent_at,
-        gmail_message_id,
-        message,
-        parent_tracking_id,
-        recipient if parent_tracking_id else None,
-        sent_at if parent_tracking_id else None
+        gmail_message_id
     ))
 
     conn.commit()
@@ -912,7 +867,11 @@ def send_one_email(
         "success": True,
         "tracking_id": tracking_id,
         "recipient": recipient,
-        "message_id": gmail_message_id
+        "message_id": gmail_message_id,
+        "tracking_url":
+            PUBLIC_URL
+            + "/go/"
+            + tracking_id
     }
 
 
@@ -1071,96 +1030,6 @@ def send_from_dashboard():
         results=results,
         invalid=invalid
     )
-
-
-# ============================================================
-# FORWARD AS A NEW TRACKED COPY
-# ============================================================
-
-@APP.post("/forward")
-def forward_tracked_copy():
-
-    tracking_id = request.form.get(
-        "tracking_id",
-        ""
-    ).strip()
-
-    recipient = request.form.get(
-        "recipient",
-        ""
-    ).strip()
-
-    if not tracking_exists(tracking_id):
-        return render_template_string(
-            MESSAGE_HTML,
-            title="Forward Error",
-            message="Invalid tracking ID.",
-            back=True
-        ), 404
-
-    if not valid_email(recipient):
-        return render_template_string(
-            MESSAGE_HTML,
-            title="Forward Error",
-            message="Please enter a valid recipient email.",
-            back=True
-        ), 400
-
-    conn = get_db()
-
-    source = conn.execute("""
-        SELECT
-            subject,
-            message_body
-        FROM emails
-        WHERE tracking_id = ?
-    """, (
-        tracking_id,
-    )).fetchone()
-
-    conn.close()
-
-    if not source:
-        return render_template_string(
-            MESSAGE_HTML,
-            title="Forward Error",
-            message="Original tracked email was not found.",
-            back=True
-        ), 404
-
-    message_body = source["message_body"] or ""
-
-    subject = source["subject"] or ""
-
-    if not subject.lower().startswith("fwd:"):
-        subject = "Fwd: " + subject
-
-    try:
-
-        service = gmail_service()
-
-        result = send_one_email(
-            service,
-            recipient,
-            subject,
-            message_body,
-            parent_tracking_id=tracking_id
-        )
-
-        return render_template_string(
-            SEND_RESULT_HTML,
-            results=[result],
-            invalid=[]
-        )
-
-    except Exception as e:
-
-        return render_template_string(
-            MESSAGE_HTML,
-            title="Forward Error",
-            message=str(e),
-            back=True
-        ), 500
 
 
 # ============================================================
@@ -1544,10 +1413,7 @@ def get_activity(tracking_id):
         SELECT
             recipient,
             subject,
-            sent_at,
-            parent_tracking_id,
-            forwarded_to,
-            forwarded_at
+            sent_at
         FROM emails
         WHERE tracking_id = ?
     """, (
@@ -1707,10 +1573,6 @@ def get_emails():
 
         item["sent_ist"] = display_time(
             item["sent_at"]
-        )
-
-        item["forwarded_at_ist"] = display_time(
-            item["forwarded_at"]
         )
 
         # ----------------------------------------------------
@@ -2184,14 +2046,6 @@ Page Visits
 </th>
 
 <th>
-Forwarded From
-</th>
-
-<th>
-Forwarded To
-</th>
-
-<th>
 Actions
 </th>
 
@@ -2261,26 +2115,6 @@ Actions
 
 </td>
 
-<td class="small">
-
-{% if e["parent_tracking_id"] %}
-{{ e["parent_tracking_id"] }}
-{% else %}
--
-{% endif %}
-
-</td>
-
-<td class="small">
-
-{% if e["forwarded_to"] %}
-{{ e["forwarded_to"] }}
-{% else %}
--
-{% endif %}
-
-</td>
-
 <td>
 
 <a
@@ -2299,39 +2133,6 @@ View Activity
 Test Link
 </a>
 
-<form
-    method="POST"
-    action="/forward"
-    style="display:inline-block;"
-    onsubmit="return confirm(
-        'Create a new tracked copy for this email?'
-    );"
->
-
-<input
-    type="hidden"
-    name="tracking_id"
-    value="{{ e["tracking_id"] }}"
->
-
-<input
-    type="email"
-    name="recipient"
-    placeholder="Forward to email"
-    required
-    style="width:180px;padding:7px;border:1px solid #ccc;border-radius:6px;"
->
-
-<button
-    type="submit"
-    class="action"
-    style="border:0;"
->
-Forward as Tracked Copy
-</button>
-
-</form>
-
 </td>
 
 </tr>
@@ -2341,7 +2142,7 @@ Forward as Tracked Copy
 <tr>
 
 <td
-    colspan="11"
+    colspan="9"
 >
 
 No emails sent yet.
@@ -2709,42 +2510,6 @@ Sent:
 </strong>
 
 {{ format_time(email["sent_at"]) }}
-
-{% if email["parent_tracking_id"] %}
-
-<br>
-
-<strong>
-Forwarded From:
-</strong>
-
-{{ email["parent_tracking_id"] }}
-
-{% endif %}
-
-{% if email["forwarded_to"] %}
-
-<br>
-
-<strong>
-Forwarded To:
-</strong>
-
-{{ email["forwarded_to"] }}
-
-{% endif %}
-
-{% if email["forwarded_at"] %}
-
-<br>
-
-<strong>
-Forwarded At:
-</strong>
-
-{{ format_time(email["forwarded_at"]) }}
-
-{% endif %}
 
 </div>
 
@@ -3144,6 +2909,13 @@ body {
         5px solid #d64545;
 }
 
+.url {
+
+    word-break:break-all;
+
+    font-family:monospace;
+}
+
 a {
 
     color:#1261a0;
@@ -3174,6 +2946,25 @@ Sent:
 {{ r["recipient"] }}
 
 <br><br>
+
+<strong>
+Tracking URL:
+</strong>
+
+<div class="url">
+
+<a
+    href="{{ r["tracking_url"] }}"
+    target="_blank"
+>
+
+{{ r["tracking_url"] }}
+
+</a>
+
+</div>
+
+<br>
 
 <strong>
 Tracking ID:
