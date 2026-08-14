@@ -2624,38 +2624,52 @@ Sent:
 
 {{ format_time(email["sent_at"]) }}
 
-</div>
+<br>
 
-{% if email %}
+<strong>
+Opens:
+</strong>
 
-<div class="info">
-
-<strong>Opens:</strong>
 {{ email["open_count"] or 0 }}
 
 <br>
 
-<strong>First Open:</strong>
+<strong>
+First Open:
+</strong>
+
 {{ format_time(email["first_opened_at"]) }}
 
 <br>
 
-<strong>Last Open:</strong>
+<strong>
+Last Open:
+</strong>
+
 {{ format_time(email["last_opened_at"]) }}
 
 <br>
 
-<strong>Clicks:</strong>
+<strong>
+Clicks:
+</strong>
+
 {{ email["click_count"] or 0 }}
 
 <br>
 
-<strong>First Click:</strong>
+<strong>
+First Click:
+</strong>
+
 {{ format_time(email["first_clicked_at"]) }}
 
 <br>
 
-<strong>Last Click:</strong>
+<strong>
+Last Click:
+</strong>
+
 {{ format_time(email["last_clicked_at"]) }}
 
 </div>
