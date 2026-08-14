@@ -27,8 +27,8 @@ from googleapiclient.discovery import build
 
 APP = Flask(__name__)
 
-HOST = "127.0.0.1"
-PORT = 5000
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", 5000))
 
 DB_FILE = "tracker.db"
 
