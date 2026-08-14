@@ -4,6 +4,8 @@ import sqlite3
 import secrets
 import base64
 import json
+import csv
+import io
 
 
 from datetime import datetime, timezone, timedelta
@@ -597,9 +599,8 @@ def log_activity(
     # --------------------------------------------------------
     # OPEN
     #
-    # Only count is maintained.
-    #
-    # First Open / Last Open are intentionally NOT updated.
+    # Count every observed tracking-pixel request and keep
+    # first/last observed open timestamps.
     # --------------------------------------------------------
 
     if event == "open":
@@ -609,12 +610,22 @@ def log_activity(
 
             SET
 
+                first_opened_at =
+                    COALESCE(
+                        first_opened_at,
+                        ?
+                    ),
+
+                last_opened_at = ?,
+
                 open_count =
                     open_count + 1
 
             WHERE tracking_id = ?
         """, (
-            tracking_id,
+            now,
+            now,
+            tracking_id
         ))
 
     # --------------------------------------------------------
@@ -752,15 +763,6 @@ def create_email_html(
 Open link
 
 </a>
-
-</p>
-
-<p style="
-    font-size:12px;
-    color:#777;
-">
-
-This email contains a tracking link.
 
 </p>
 
@@ -1442,6 +1444,111 @@ def get_activity(tracking_id):
 #   - email record
 #   - tracking ID
 #   - form submissions
+
+# ============================================================
+# DOWNLOAD ACTIVITY + FORM SUBMISSION REPORT
+# ============================================================
+
+@APP.get(
+    "/api/activity/<tracking_id>/report"
+)
+def download_activity_report(tracking_id):
+
+    if not tracking_exists(tracking_id):
+
+        return render_template_string(
+            MESSAGE_HTML,
+            title="Invalid Tracking ID",
+            message="This tracking ID is invalid.",
+            back=True
+        ), 404
+
+    conn = get_db()
+
+    email_row = conn.execute("""
+        SELECT *
+        FROM emails
+        WHERE tracking_id = ?
+    """, (tracking_id,)).fetchone()
+
+    activity_rows = conn.execute("""
+        SELECT id, event, timestamp, ip, user_agent, referer
+        FROM activity
+        WHERE tracking_id = ?
+        ORDER BY id ASC
+    """, (tracking_id,)).fetchall()
+
+    submission_rows = conn.execute("""
+        SELECT id, name, phone, email, submitted_at, ip, user_agent, referer
+        FROM form_submissions
+        WHERE tracking_id = ?
+        ORDER BY id ASC
+    """, (tracking_id,)).fetchall()
+
+    conn.close()
+
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+
+    writer.writerow(["EMAIL TRACKING REPORT"])
+    writer.writerow(["Tracking ID", tracking_id])
+    writer.writerow(["Recipient", email_row["recipient"]])
+    writer.writerow(["Subject", email_row["subject"] or ""])
+    writer.writerow(["Sent At", display_time(email_row["sent_at"])])
+    writer.writerow(["Open Count", email_row["open_count"] or 0])
+    writer.writerow(["First Open", display_time(email_row["first_opened_at"])])
+    writer.writerow(["Last Open", display_time(email_row["last_opened_at"])])
+    writer.writerow(["Click Count", email_row["click_count"] or 0])
+    writer.writerow(["First Click", display_time(email_row["first_clicked_at"])])
+    writer.writerow(["Last Click", display_time(email_row["last_clicked_at"])])
+    writer.writerow([])
+
+    writer.writerow(["ACTIVITY"])
+    writer.writerow(["ID", "Event", "Time", "IP", "User Agent", "Referer"])
+
+    for row in activity_rows:
+        writer.writerow([
+            row["id"],
+            row["event"],
+            display_time(row["timestamp"]),
+            row["ip"] or "",
+            row["user_agent"] or "",
+            row["referer"] or ""
+        ])
+
+    writer.writerow([])
+    writer.writerow(["FORM SUBMISSIONS"])
+    writer.writerow([
+        "ID", "Name", "Phone", "Email", "Submitted",
+        "IP", "User Agent", "Referer"
+    ])
+
+    for row in submission_rows:
+        writer.writerow([
+            row["id"],
+            row["name"] or "",
+            row["phone"] or "",
+            row["email"] or "",
+            display_time(row["submitted_at"]),
+            row["ip"] or "",
+            row["user_agent"] or "",
+            row["referer"] or ""
+        ])
+
+    response = APP.response_class(
+        output.getvalue(),
+        mimetype="text/csv"
+    )
+
+    response.headers["Content-Disposition"] = (
+        'attachment; filename="'
+        + tracking_id
+        + '_activity_report.csv"'
+    )
+
+    return response
+
+
 # ============================================================
 
 @APP.post(
@@ -2513,6 +2620,40 @@ Sent:
 
 </div>
 
+{% if email %}
+
+<div class="info">
+
+<strong>Opens:</strong>
+{{ email["open_count"] or 0 }}
+
+<br>
+
+<strong>First Open:</strong>
+{{ format_time(email["first_opened_at"]) }}
+
+<br>
+
+<strong>Last Open:</strong>
+{{ format_time(email["last_opened_at"]) }}
+
+<br>
+
+<strong>Clicks:</strong>
+{{ email["click_count"] or 0 }}
+
+<br>
+
+<strong>First Click:</strong>
+{{ format_time(email["first_clicked_at"]) }}
+
+<br>
+
+<strong>Last Click:</strong>
+{{ format_time(email["last_clicked_at"]) }}
+
+</div>
+
 {% endif %}
 
 
@@ -2547,6 +2688,13 @@ Delete Activity
 </button>
 
 </form>
+
+<a
+    class="action"
+    href="/api/activity/{{ tracking_id }}/report"
+>
+Download Report (CSV)
+</a>
 
 </div>
 
@@ -3655,4 +3803,4 @@ if __name__ == "__main__":
         port=PORT,
         debug=False,
         threaded=True
-    )
+    
