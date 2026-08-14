@@ -3,23 +3,21 @@ import re
 import sqlite3
 import secrets
 import base64
-import json
 
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from html import escape
-from urllib.parse import urlparse
 
 from flask import (
     Flask,
     request,
     jsonify,
     render_template_string,
-    redirect,
 )
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 
@@ -29,8 +27,8 @@ from googleapiclient.discovery import build
 
 APP = Flask(__name__)
 
-HOST = "0.0.0.0"
-PORT = int(os.environ.get("PORT", 5000))
+HOST = "127.0.0.1"
+PORT = 5000
 
 DB_FILE = "tracker.db"
 
@@ -50,7 +48,7 @@ SCOPES = [
 
 PUBLIC_URL = os.environ.get(
     "PUBLIC_URL",
-    "https://email-tracker-7tr6.onrender.com"
+    "https://performer-wooden-pipes-mrna.trycloudflare.com"
 ).rstrip("/")
 
 
@@ -178,42 +176,6 @@ def init_db():
     """)
 
     # --------------------------------------------------------
-    # DESTINATION URL MIGRATION
-    # --------------------------------------------------------
-    # Each email can point to any user-supplied HTTP/HTTPS URL.
-    # Existing databases get the column automatically.
-    # --------------------------------------------------------
-
-    try:
-
-        cur.execute("""
-            ALTER TABLE emails
-            ADD COLUMN destination_url TEXT
-        """)
-
-    except sqlite3.OperationalError:
-
-        # Column already exists.
-        pass
-
-    # --------------------------------------------------------
-    # FORWARD CHAIN
-    # --------------------------------------------------------
-    # Native Gmail forwarding cannot be intercepted. These fields are
-    # used by the app's explicit "Forward as Tracked Copy" action.
-    # --------------------------------------------------------
-
-    for column_sql in (
-        "ALTER TABLE emails ADD COLUMN parent_tracking_id TEXT",
-        "ALTER TABLE emails ADD COLUMN forwarded_to TEXT",
-        "ALTER TABLE emails ADD COLUMN forwarded_at TEXT",
-    ):
-        try:
-            cur.execute(column_sql)
-        except sqlite3.OperationalError:
-            pass
-
-    # --------------------------------------------------------
     # ACTIVITY
     # --------------------------------------------------------
 
@@ -320,79 +282,19 @@ def gmail_service():
 
     creds = None
 
-    # ========================================================
-    # 1. LOAD AUTHORIZED TOKEN FROM RENDER ENVIRONMENT
-    # ========================================================
-    #
-    # Render Environment Variable:
-    #
-    # GMAIL_TOKEN_JSON
-    #
-    # Value = COMPLETE contents of token.json
-    #
-    # Example:
-    # {
-    #   "token": "...",
-    #   "refresh_token": "...",
-    #   "token_uri": "https://oauth2.googleapis.com/token",
-    #   "client_id": "...",
-    #   "client_secret": "...",
-    #   "scopes": [
-    #       "https://www.googleapis.com/auth/gmail.send"
-    #   ]
-    # }
-    #
-    # IMPORTANT:
-    # We do NOT call run_local_server() on Render.
-    # That would require a browser and causes the deployment problem.
-    # ========================================================
+    # --------------------------------------------------------
+    # Existing token
+    # --------------------------------------------------------
 
-    token_json = os.environ.get("GMAIL_TOKEN_JSON")
-
-    if token_json:
-
-        try:
-
-            token_data = json.loads(token_json)
-
-            creds = Credentials.from_authorized_user_info(
-                token_data,
-                SCOPES
-            )
-
-            print(
-                "Gmail token loaded from GMAIL_TOKEN_JSON."
-            )
-
-        except Exception as e:
-
-            print(
-                "Could not load GMAIL_TOKEN_JSON:",
-                e
-            )
-
-            creds = None
-
-    # ========================================================
-    # 2. LOCAL DEVELOPMENT FALLBACK
-    # ========================================================
-    #
-    # This lets the same code work locally if token.json exists.
-    #
-    # Render does not need this when GMAIL_TOKEN_JSON is configured.
-    # ========================================================
-
-    if creds is None and os.path.exists(TOKEN_FILE):
+    if os.path.exists(
+        TOKEN_FILE
+    ):
 
         try:
 
             creds = Credentials.from_authorized_user_file(
                 TOKEN_FILE,
                 SCOPES
-            )
-
-            print(
-                "Gmail token loaded from token.json."
             )
 
         except Exception as e:
@@ -404,9 +306,9 @@ def gmail_service():
 
             creds = None
 
-    # ========================================================
-    # 3. REFRESH EXPIRED TOKEN
-    # ========================================================
+    # --------------------------------------------------------
+    # Refresh token
+    # --------------------------------------------------------
 
     if (
         creds
@@ -420,10 +322,6 @@ def gmail_service():
                 Request()
             )
 
-            print(
-                "Gmail token refreshed successfully."
-            )
-
         except Exception as e:
 
             print(
@@ -433,40 +331,56 @@ def gmail_service():
 
             creds = None
 
-    # ========================================================
-    # 4. NEVER START INTERACTIVE OAUTH ON RENDER
-    # ========================================================
-    #
-    # If this happens, either:
-    #
-    # - GMAIL_TOKEN_JSON is missing
-    # - token.json is invalid
-    # - token.json does not contain a refresh token
-    # - the Google OAuth token has been revoked
-    #
-    # Generate/authorize token.json locally, then put its COMPLETE
-    # contents into the Render variable GMAIL_TOKEN_JSON.
-    # ========================================================
+    # --------------------------------------------------------
+    # First login
+    # --------------------------------------------------------
 
     if not creds or not creds.valid:
 
-        raise RuntimeError(
-            "Gmail authentication failed. "
-            "Set GMAIL_TOKEN_JSON in Render to the complete "
-            "contents of your authorized token.json file. "
-            "Do not use run_local_server() on Render."
+        if not os.path.exists(
+            CREDENTIALS_FILE
+        ):
+
+            raise FileNotFoundError(
+                "credentials.json nahi mila. "
+                "Google Cloud Console se OAuth Desktop "
+                "credentials download karke app.py ke "
+                "same folder mein rakho."
+            )
+
+        print()
+        print("=" * 60)
+        print("Google OAuth login required")
+        print("=" * 60)
+
+        flow = InstalledAppFlow.from_client_secrets_file(
+            CREDENTIALS_FILE,
+            SCOPES
         )
 
-    # ========================================================
-    # 5. BUILD GMAIL API SERVICE
-    # ========================================================
+        creds = flow.run_local_server(
+            port=0
+        )
+
+        with open(
+            TOKEN_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            f.write(
+                creds.to_json()
+            )
+
+        print(
+            "token.json automatically created."
+        )
 
     return build(
         "gmail",
         "v1",
         credentials=creds
     )
-
 
 
 # ============================================================
@@ -634,7 +548,9 @@ def log_activity(
     # --------------------------------------------------------
     # OPEN
     #
-    # Record every open event and maintain first/last open times.
+    # Only count is maintained.
+    #
+    # First Open / Last Open are intentionally NOT updated.
     # --------------------------------------------------------
 
     if event == "open":
@@ -644,22 +560,12 @@ def log_activity(
 
             SET
 
-                first_opened_at =
-                    COALESCE(
-                        first_opened_at,
-                        ?
-                    ),
-
-                last_opened_at = ?,
-
                 open_count =
                     open_count + 1
 
             WHERE tracking_id = ?
         """, (
-            now,
-            now,
-            tracking_id
+            tracking_id,
         ))
 
     # --------------------------------------------------------
@@ -731,25 +637,9 @@ def log_activity(
 # CREATE EMAIL HTML
 # ============================================================
 
-def valid_destination_url(value):
-
-    value = str(value or "").strip()
-
-    try:
-
-        parsed = urlparse(value)
-
-        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
-
-    except Exception:
-
-        return False
-
-
 def create_email_html(
     tracking_id,
-    message,
-    destination_url
+    message
 ):
 
     tracking_url = (
@@ -770,46 +660,59 @@ def create_email_html(
     )
 
     safe_tracking_url = escape(
-        tracking_url,
-        quote=True
+        tracking_url
     )
 
     safe_pixel_url = escape(
-        pixel_url,
-        quote=True
-    )
-
-    safe_destination_url = escape(
-        destination_url,
-        quote=True
+        pixel_url
     )
 
     return f"""
 <!doctype html>
+
 <html>
+
 <head>
+
 <meta charset="utf-8">
+
 </head>
+
 <body>
 
-<div style="white-space:pre-wrap;font-family:Arial,sans-serif;line-height:1.5;">
+<div style="
+    white-space:pre-wrap;
+    font-family:Arial,sans-serif;
+    line-height:1.5;
+">
+
 {safe_message}
+
 </div>
 
 <br>
 
 <p>
+
 <a
     href="{safe_tracking_url}"
     target="_blank"
     rel="noopener noreferrer"
 >
+
 Open link
+
 </a>
+
 </p>
 
-<p style="font-size:12px;color:#777;">
+<p style="
+    font-size:12px;
+    color:#777;
+">
+
 This email contains a tracking link.
+
 </p>
 
 <img
@@ -821,6 +724,7 @@ This email contains a tracking link.
 >
 
 </body>
+
 </html>
 """
 
@@ -833,10 +737,7 @@ def send_one_email(
     service,
     recipient,
     subject,
-    message,
-    destination_url,
-    parent_tracking_id=None,
-    forwarded_to=None
+    message
 ):
 
     tracking_id = secrets.token_urlsafe(
@@ -847,20 +748,19 @@ def send_one_email(
 
     html = create_email_html(
         tracking_id,
-        message,
-        destination_url
+        message
     )
 
     msg = EmailMessage()
 
     msg["To"] = recipient
+
     msg["From"] = SENDER_EMAIL
+
     msg["Subject"] = subject
 
     msg.set_content(
         message
-        + "\n\n"
-        + destination_url
     )
 
     msg.add_alternative(
@@ -893,30 +793,25 @@ def send_one_email(
 
     conn.execute("""
         INSERT INTO emails (
+
             tracking_id,
             recipient,
             subject,
             sent_at,
-            gmail_message_id,
-            destination_url,
-            parent_tracking_id,
-            forwarded_to,
-            forwarded_at
+            gmail_message_id
+
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?)
     """, (
         tracking_id,
         recipient,
         subject,
         sent_at,
-        gmail_message_id,
-        destination_url,
-        parent_tracking_id,
-        forwarded_to,
-        sent_at if parent_tracking_id else None
+        gmail_message_id
     ))
 
     conn.commit()
+
     conn.close()
 
     return {
@@ -924,9 +819,6 @@ def send_one_email(
         "tracking_id": tracking_id,
         "recipient": recipient,
         "message_id": gmail_message_id,
-        "destination_url": destination_url,
-        "parent_tracking_id": parent_tracking_id,
-        "forwarded_to": forwarded_to,
         "tracking_url":
             PUBLIC_URL
             + "/go/"
@@ -982,17 +874,13 @@ def send_from_dashboard():
         ""
     ).strip()
 
-    destination_url = request.form.get(
-        "destination_url",
-        ""
-    ).strip()
-
     raw_recipients = re.split(
         r"[\n,;]+",
         recipients_text
     )
 
     recipients = []
+
     invalid = []
 
     for item in raw_recipients:
@@ -1000,6 +888,7 @@ def send_from_dashboard():
         email = item.strip()
 
         if not email:
+
             continue
 
         if valid_email(email):
@@ -1024,7 +913,10 @@ def send_from_dashboard():
         return render_template_string(
             MESSAGE_HTML,
             title="Error",
-            message="At least one valid recipient email required.",
+            message=(
+                "At least one valid recipient "
+                "email required."
+            ),
             back=True
         ), 400
 
@@ -1043,18 +935,6 @@ def send_from_dashboard():
             MESSAGE_HTML,
             title="Error",
             message="Message required.",
-            back=True
-        ), 400
-
-    if not valid_destination_url(destination_url):
-
-        return render_template_string(
-            MESSAGE_HTML,
-            title="Invalid Destination URL",
-            message=(
-                "Enter a complete HTTP/HTTPS URL, for example "
-                "https://example.com/form"
-            ),
             back=True
         ), 400
 
@@ -1081,8 +961,7 @@ def send_from_dashboard():
                 service,
                 recipient,
                 subject,
-                message,
-                destination_url
+                message
             )
 
             results.append(
@@ -1176,126 +1055,33 @@ def track_open(tracking_id):
 )
 def tracked_link(tracking_id):
 
-    conn = get_db()
-
-    row = conn.execute("""
-        SELECT destination_url
-        FROM emails
-        WHERE tracking_id = ?
-    """, (
-        tracking_id,
-    )).fetchone()
-
-    conn.close()
-
-    if not row or not row["destination_url"]:
+    if not tracking_exists(
+        tracking_id
+    ):
 
         return render_template_string(
             MESSAGE_HTML,
             title="Invalid Link",
-            message="This tracking link is invalid or has no destination URL.",
+            message=(
+                "This tracking link is "
+                "invalid or expired."
+            ),
             back=False
         ), 404
 
-    # Record the click BEFORE redirecting to the user's URL.
+    # --------------------------------------------------------
+    # Every request to /go/<tracking_id> = CLICK
+    # --------------------------------------------------------
+
     log_activity(
         tracking_id,
         "click"
     )
 
-    return redirect(
-        row["destination_url"],
-        code=302
-    )
-
-
-# ============================================================
-# FORWARD AS TRACKED COPY
-# ============================================================
-
-@APP.get("/forward/<tracking_id>")
-def forward_form(tracking_id):
-
-    conn = get_db()
-    row = conn.execute("""
-        SELECT tracking_id, recipient, subject, destination_url
-        FROM emails
-        WHERE tracking_id = ?
-    """, (tracking_id,)).fetchone()
-    conn.close()
-
-    if not row:
-        return render_template_string(
-            MESSAGE_HTML,
-            title="Invalid Tracking ID",
-            message="This tracking ID is invalid.",
-            back=True
-        ), 404
-
     return render_template_string(
-        FORWARD_HTML,
-        tracking_id=tracking_id,
-        original_recipient=row["recipient"],
-        subject=row["subject"] or "",
-        destination_url=row["destination_url"] or ""
+        LANDING_HTML,
+        tracking_id=tracking_id
     )
-
-
-@APP.post("/forward/<tracking_id>")
-def forward_tracked_copy(tracking_id):
-
-    forwarded_to = request.form.get("forwarded_to", "").strip()
-
-    if not valid_email(forwarded_to):
-        return render_template_string(
-            MESSAGE_HTML,
-            title="Invalid Email",
-            message="Enter a valid recipient email address.",
-            back=True
-        ), 400
-
-    conn = get_db()
-    row = conn.execute("""
-        SELECT recipient, subject, destination_url
-        FROM emails
-        WHERE tracking_id = ?
-    """, (tracking_id,)).fetchone()
-    conn.close()
-
-    if not row or not row["destination_url"]:
-        return render_template_string(
-            MESSAGE_HTML,
-            title="Invalid Tracking ID",
-            message="The original tracked email or destination URL was not found.",
-            back=True
-        ), 404
-
-    try:
-        service = gmail_service()
-        result = send_one_email(
-            service,
-            forwarded_to,
-            row["subject"] or "",
-            "This is a tracked copy forwarded from the original recipient.\n\n"
-            + "Original recipient: " + row["recipient"],
-            row["destination_url"],
-            parent_tracking_id=tracking_id,
-            forwarded_to=forwarded_to
-        )
-
-        return render_template_string(
-            FORWARD_RESULT_HTML,
-            result=result,
-            parent_tracking_id=tracking_id
-        )
-
-    except Exception as e:
-        return render_template_string(
-            MESSAGE_HTML,
-            title="Forward Error",
-            message=str(e),
-            back=True
-        ), 500
 
 
 # ============================================================
@@ -1578,8 +1364,7 @@ def get_activity(tracking_id):
         SELECT
             recipient,
             subject,
-            sent_at,
-            destination_url
+            sent_at
         FROM emails
         WHERE tracking_id = ?
     """, (
@@ -1741,12 +1526,18 @@ def get_emails():
             item["sent_at"]
         )
 
-        item["first_open_ist"] = display_time(
-            item["first_opened_at"]
+        # ----------------------------------------------------
+        # First Open / Last Open intentionally NOT returned.
+        # ----------------------------------------------------
+
+        item.pop(
+            "first_opened_at",
+            None
         )
 
-        item["last_open_ist"] = display_time(
-            item["last_opened_at"]
+        item.pop(
+            "last_opened_at",
+            None
         )
 
         item["first_click_ist"] = display_time(
@@ -2074,14 +1865,7 @@ so an open event is not guaranteed proof of
 manual reading.
 
 Click tracking is generated when the unique
-tracking URL is requested. After the click is logged,
-the visitor is redirected to the destination URL you entered.
-
-The saved destination URL is shown in the dashboard
-and activity page. The tracker records the click/
-redirect request, but cannot see actions performed
-inside an external website unless that website provides
-its own integration.
+tracking URL is requested.
 
 The information form is shown openly on the
 landing page and requires the visitor to
@@ -2149,24 +1933,6 @@ Message
 ></textarea>
 
 
-<label>
-Destination URL
-</label>
-
-<input
-    name="destination_url"
-    type="url"
-    placeholder="https://example.com/form"
-    required
->
-
-<p class="small">
-This exact URL is saved with this email. It is shown as the visible
-link in the email; the click is recorded first, then the visitor is
-redirected to this URL.
-</p>
-
-
 <button
     type="submit"
 >
@@ -2190,12 +1956,6 @@ Send Email
 Tracking
 </h2>
 
-<p class="small">
-Open count comes from the email tracking pixel. Gmail and other mail
-providers may preload or cache images, so an OPEN event is not guaranteed
-to mean the recipient manually read the email.
-</p>
-
 <div class="table-wrap">
 
 <table>
@@ -2213,23 +1973,11 @@ Subject
 </th>
 
 <th>
-Destination URL
-</th>
-
-<th>
 Sent
 </th>
 
 <th>
 Opens
-</th>
-
-<th>
-First Open
-</th>
-
-<th>
-Last Open
 </th>
 
 <th>
@@ -2245,11 +1993,7 @@ Last Click
 </th>
 
 <th>
-Forwarded To
-</th>
-
-<th>
-Parent Tracking ID
+Page Visits
 </th>
 
 <th>
@@ -2274,12 +2018,6 @@ Actions
 {{ e["subject"] or "-" }}
 </td>
 
-<td class="small">
-<a href="{{ e["destination_url"] }}" target="_blank" rel="noopener noreferrer">
-{{ e["destination_url"] }}
-</a>
-</td>
-
 <td class="time">
 
 {{ format_time(e["sent_at"]) }}
@@ -2287,31 +2025,23 @@ Actions
 </td>
 
 <td>
+
 <span class="badge">
 
 {{ e["open_count"] or 0 }}
 
 </span>
-</td>
-
-<td class="time">
-
-{{ format_time(e["first_opened_at"]) }}
-
-</td>
-
-<td class="time">
-
-{{ format_time(e["last_opened_at"]) }}
 
 </td>
 
 <td>
+
 <span class="badge">
 
 {{ e["click_count"] or 0 }}
 
 </span>
+
 </td>
 
 <td class="time">
@@ -2326,12 +2056,14 @@ Actions
 
 </td>
 
-<td class="small">
-{{ e["forwarded_to"] or "-" }}
-</td>
+<td>
 
-<td class="small">
-{{ e["parent_tracking_id"] or "-" }}
+<span class="badge">
+
+{{ e["page_visit_count"] or 0 }}
+
+</span>
+
 </td>
 
 <td>
@@ -2342,14 +2074,6 @@ Actions
     target="_blank"
 >
 View Activity
-</a>
-
-<a
-    class="action"
-    href="/forward/{{ e["tracking_id"] }}"
-    target="_blank"
->
-Forward as Tracked Copy
 </a>
 
 <a
@@ -2369,7 +2093,7 @@ Test Link
 <tr>
 
 <td
-    colspan="10"
+    colspan="9"
 >
 
 No emails sent yet.
@@ -2738,20 +2462,6 @@ Sent:
 
 {{ format_time(email["sent_at"]) }}
 
-<br>
-
-<strong>
-Destination URL:
-</strong>
-
-{% if email["destination_url"] %}
-<a href="{{ email["destination_url"] }}" target="_blank" rel="noopener noreferrer">
-{{ email["destination_url"] }}
-</a>
-{% else %}
--
-{% endif %}
-
 </div>
 
 {% endif %}
@@ -2803,13 +2513,6 @@ Delete Activity
 <h2>
 Activity History
 </h2>
-
-<p class="small">
-OPEN = the email tracking pixel was requested.
-DESTINATION CLICK = the tracked destination URL was requested,
-recorded, and then opened in the visitor's browser.
-Each event includes its timestamp and request metadata.
-</p>
 
 <div class="table-wrap">
 
@@ -2868,7 +2571,7 @@ OPEN
 {% elif row["event"] == "click" %}
 
 <span class="event event-click">
-DESTINATION CLICK
+CLICK
 </span>
 
 {% elif row["event"] == "page_visit" %}
@@ -3091,69 +2794,6 @@ No form has been submitted yet.
 
 
 # ============================================================
-# FORWARD HTML
-# ============================================================
-
-FORWARD_HTML = """
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Forward as Tracked Copy</title>
-<style>
-body{font-family:Arial,sans-serif;background:#f4f6f9;padding:30px;color:#222}
-.card{max-width:700px;margin:auto;background:white;padding:25px;border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.08)}
-input{width:100%;box-sizing:border-box;padding:12px;border:1px solid #ccc;border-radius:8px;font-size:15px}
-button{margin-top:18px;padding:12px 20px;background:#222;color:#fff;border:0;border-radius:8px;cursor:pointer}
-.info{background:#f0f2f5;padding:14px;border-radius:8px;line-height:1.6}
-.warning{background:#fff4e5;border:1px solid #ffd8a8;padding:12px;border-radius:8px;line-height:1.5}
-</style>
-</head>
-<body>
-<div class="card">
-<h2>Forward as Tracked Copy</h2>
-<p class="warning"><strong>Important:</strong> Normal Gmail Forward cannot be intercepted by this app. Use this form to create a new tracking ID for the next recipient.</p>
-<div class="info">
-<strong>Original recipient:</strong> {{ original_recipient }}<br>
-<strong>Subject:</strong> {{ subject or "-" }}<br>
-<strong>Original tracking ID:</strong> {{ tracking_id }}<br>
-<strong>Destination:</strong> {{ destination_url }}
-</div>
-<form method="POST">
-<label><strong>Forward to</strong></label>
-<input name="forwarded_to" type="email" placeholder="person@example.com" required>
-<button type="submit">Send New Tracked Copy</button>
-</form>
-<p><a href="/">← Dashboard</a></p>
-</div>
-</body>
-</html>
-"""
-
-# ============================================================
-# FORWARD RESULT HTML
-# ============================================================
-
-FORWARD_RESULT_HTML = """
-<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Forward Sent</title></head>
-<body style="font-family:Arial,sans-serif;background:#f4f6f9;padding:30px">
-<div style="max-width:700px;margin:auto;background:white;padding:25px;border-radius:12px">
-<h2>Tracked Copy Sent</h2>
-<p>A new tracking ID was created for the forwarded recipient.</p>
-<p><strong>Parent tracking ID:</strong> {{ parent_tracking_id }}</p>
-<p><strong>New tracking ID:</strong> {{ result["tracking_id"] }}</p>
-<p><strong>Recipient:</strong> {{ result["recipient"] }}</p>
-<p><a href="/">← Dashboard</a></p>
-</div>
-</body>
-</html>
-"""
-
-
-# ============================================================
 # SEND RESULT HTML
 # ============================================================
 
@@ -3259,27 +2899,20 @@ Sent:
 <br><br>
 
 <strong>
-Destination URL:
-</strong>
-
-<div class="url">
-<a
-    href="{{ r["destination_url"] }}"
-    target="_blank"
-    rel="noopener noreferrer"
->
-{{ r["destination_url"] }}
-</a>
-</div>
-
-<br>
-
-<strong>
 Tracking URL:
 </strong>
 
 <div class="url">
+
+<a
+    href="{{ r["tracking_url"] }}"
+    target="_blank"
+>
+
 {{ r["tracking_url"] }}
+
+</a>
+
 </div>
 
 <br>
@@ -3957,9 +3590,7 @@ if __name__ == "__main__":
     )
 
     print(
-        "GMAIL_TOKEN_JSON environment variable"
-        if os.environ.get("GMAIL_TOKEN_JSON")
-        else TOKEN_FILE
+        TOKEN_FILE
     )
 
     print()
