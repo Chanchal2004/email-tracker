@@ -35,7 +35,7 @@ DB_FILE = "tracker.db"
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE = "token.json"
 
-SENDER_EMAIL = "chanchalchaudhary112004@gmail.com"
+SENDER_EMAIL = "chanchalchaudhary0101@gmail.com"
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.send"
