@@ -3,6 +3,7 @@ import re
 import sqlite3
 import secrets
 import base64
+import json
 
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
@@ -17,7 +18,6 @@ from flask import (
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 
@@ -282,19 +282,79 @@ def gmail_service():
 
     creds = None
 
-    # --------------------------------------------------------
-    # Existing token
-    # --------------------------------------------------------
+    # ========================================================
+    # 1. LOAD AUTHORIZED TOKEN FROM RENDER ENVIRONMENT
+    # ========================================================
+    #
+    # Render Environment Variable:
+    #
+    # GMAIL_TOKEN_JSON
+    #
+    # Value = COMPLETE contents of token.json
+    #
+    # Example:
+    # {
+    #   "token": "...",
+    #   "refresh_token": "...",
+    #   "token_uri": "https://oauth2.googleapis.com/token",
+    #   "client_id": "...",
+    #   "client_secret": "...",
+    #   "scopes": [
+    #       "https://www.googleapis.com/auth/gmail.send"
+    #   ]
+    # }
+    #
+    # IMPORTANT:
+    # We do NOT call run_local_server() on Render.
+    # That would require a browser and causes the deployment problem.
+    # ========================================================
 
-    if os.path.exists(
-        TOKEN_FILE
-    ):
+    token_json = os.environ.get("GMAIL_TOKEN_JSON")
+
+    if token_json:
+
+        try:
+
+            token_data = json.loads(token_json)
+
+            creds = Credentials.from_authorized_user_info(
+                token_data,
+                SCOPES
+            )
+
+            print(
+                "Gmail token loaded from GMAIL_TOKEN_JSON."
+            )
+
+        except Exception as e:
+
+            print(
+                "Could not load GMAIL_TOKEN_JSON:",
+                e
+            )
+
+            creds = None
+
+    # ========================================================
+    # 2. LOCAL DEVELOPMENT FALLBACK
+    # ========================================================
+    #
+    # This lets the same code work locally if token.json exists.
+    #
+    # Render does not need this when GMAIL_TOKEN_JSON is configured.
+    # ========================================================
+
+    if creds is None and os.path.exists(TOKEN_FILE):
 
         try:
 
             creds = Credentials.from_authorized_user_file(
                 TOKEN_FILE,
                 SCOPES
+            )
+
+            print(
+                "Gmail token loaded from token.json."
             )
 
         except Exception as e:
@@ -306,9 +366,9 @@ def gmail_service():
 
             creds = None
 
-    # --------------------------------------------------------
-    # Refresh token
-    # --------------------------------------------------------
+    # ========================================================
+    # 3. REFRESH EXPIRED TOKEN
+    # ========================================================
 
     if (
         creds
@@ -322,6 +382,10 @@ def gmail_service():
                 Request()
             )
 
+            print(
+                "Gmail token refreshed successfully."
+            )
+
         except Exception as e:
 
             print(
@@ -331,56 +395,40 @@ def gmail_service():
 
             creds = None
 
-    # --------------------------------------------------------
-    # First login
-    # --------------------------------------------------------
+    # ========================================================
+    # 4. NEVER START INTERACTIVE OAUTH ON RENDER
+    # ========================================================
+    #
+    # If this happens, either:
+    #
+    # - GMAIL_TOKEN_JSON is missing
+    # - token.json is invalid
+    # - token.json does not contain a refresh token
+    # - the Google OAuth token has been revoked
+    #
+    # Generate/authorize token.json locally, then put its COMPLETE
+    # contents into the Render variable GMAIL_TOKEN_JSON.
+    # ========================================================
 
     if not creds or not creds.valid:
 
-        if not os.path.exists(
-            CREDENTIALS_FILE
-        ):
-
-            raise FileNotFoundError(
-                "credentials.json nahi mila. "
-                "Google Cloud Console se OAuth Desktop "
-                "credentials download karke app.py ke "
-                "same folder mein rakho."
-            )
-
-        print()
-        print("=" * 60)
-        print("Google OAuth login required")
-        print("=" * 60)
-
-        flow = InstalledAppFlow.from_client_secrets_file(
-            CREDENTIALS_FILE,
-            SCOPES
+        raise RuntimeError(
+            "Gmail authentication failed. "
+            "Set GMAIL_TOKEN_JSON in Render to the complete "
+            "contents of your authorized token.json file. "
+            "Do not use run_local_server() on Render."
         )
 
-        creds = flow.run_local_server(
-            port=0
-        )
-
-        with open(
-            TOKEN_FILE,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            f.write(
-                creds.to_json()
-            )
-
-        print(
-            "token.json automatically created."
-        )
+    # ========================================================
+    # 5. BUILD GMAIL API SERVICE
+    # ========================================================
 
     return build(
         "gmail",
         "v1",
         credentials=creds
     )
+
 
 
 # ============================================================
@@ -3590,7 +3638,9 @@ if __name__ == "__main__":
     )
 
     print(
-        TOKEN_FILE
+        "GMAIL_TOKEN_JSON environment variable"
+        if os.environ.get("GMAIL_TOKEN_JSON")
+        else TOKEN_FILE
     )
 
     print()
