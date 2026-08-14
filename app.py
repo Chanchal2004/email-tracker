@@ -1,6 +1,3 @@
-
-
-
 import os
 import re
 import sqlite3
@@ -620,9 +617,7 @@ def log_activity(
     # --------------------------------------------------------
     # OPEN
     #
-    # Only count is maintained.
-    #
-    # First Open / Last Open are intentionally NOT updated.
+    # Record every open event and maintain first/last open times.
     # --------------------------------------------------------
 
     if event == "open":
@@ -632,12 +627,22 @@ def log_activity(
 
             SET
 
+                first_opened_at =
+                    COALESCE(
+                        first_opened_at,
+                        ?
+                    ),
+
+                last_opened_at = ?,
+
                 open_count =
                     open_count + 1
 
             WHERE tracking_id = ?
         """, (
-            tracking_id,
+            now,
+            now,
+            tracking_id
         ))
 
     # --------------------------------------------------------
@@ -726,7 +731,8 @@ def valid_destination_url(value):
 
 def create_email_html(
     tracking_id,
-    message
+    message,
+    destination_url
 ):
 
     tracking_url = (
@@ -753,6 +759,11 @@ def create_email_html(
 
     safe_pixel_url = escape(
         pixel_url,
+        quote=True
+    )
+
+    safe_destination_url = escape(
+        destination_url,
         quote=True
     )
 
@@ -817,7 +828,8 @@ def send_one_email(
 
     html = create_email_html(
         tracking_id,
-        message
+        message,
+        destination_url
     )
 
     msg = EmailMessage()
@@ -828,10 +840,8 @@ def send_one_email(
 
     msg.set_content(
         message
-        + "\n\nOpen link: "
-        + PUBLIC_URL
-        + "/go/"
-        + tracking_id
+        + "\n\n"
+        + destination_url
     )
 
     msg.add_alternative(
@@ -1615,18 +1625,12 @@ def get_emails():
             item["sent_at"]
         )
 
-        # ----------------------------------------------------
-        # First Open / Last Open intentionally NOT returned.
-        # ----------------------------------------------------
-
-        item.pop(
-            "first_opened_at",
-            None
+        item["first_open_ist"] = display_time(
+            item["first_opened_at"]
         )
 
-        item.pop(
-            "last_opened_at",
-            None
+        item["last_open_ist"] = display_time(
+            item["last_opened_at"]
         )
 
         item["first_click_ist"] = display_time(
@@ -1957,6 +1961,12 @@ Click tracking is generated when the unique
 tracking URL is requested. After the click is logged,
 the visitor is redirected to the destination URL you entered.
 
+The saved destination URL is shown in the dashboard
+and activity page. The tracker records the click/
+redirect request, but cannot see actions performed
+inside an external website unless that website provides
+its own integration.
+
 The information form is shown openly on the
 landing page and requires the visitor to
 actively submit it with consent.
@@ -2035,7 +2045,9 @@ Destination URL
 >
 
 <p class="small">
-This is the URL the recipient will be sent to after the click is recorded.
+This exact URL is saved with this email. It is shown as the visible
+link in the email; the click is recorded first, then the visitor is
+redirected to this URL.
 </p>
 
 
@@ -2061,6 +2073,12 @@ Send Email
 <h2>
 Tracking
 </h2>
+
+<p class="small">
+Open count comes from the email tracking pixel. Gmail and other mail
+providers may preload or cache images, so an OPEN event is not guaranteed
+to mean the recipient manually read the email.
+</p>
 
 <div class="table-wrap">
 
@@ -2091,6 +2109,14 @@ Opens
 </th>
 
 <th>
+First Open
+</th>
+
+<th>
+Last Open
+</th>
+
+<th>
 Clicks
 </th>
 
@@ -2100,10 +2126,6 @@ First Click
 
 <th>
 Last Click
-</th>
-
-<th>
-Page Visits
 </th>
 
 <th>
@@ -2141,23 +2163,31 @@ Actions
 </td>
 
 <td>
-
 <span class="badge">
 
 {{ e["open_count"] or 0 }}
 
 </span>
+</td>
+
+<td class="time">
+
+{{ format_time(e["first_opened_at"]) }}
+
+</td>
+
+<td class="time">
+
+{{ format_time(e["last_opened_at"]) }}
 
 </td>
 
 <td>
-
 <span class="badge">
 
 {{ e["click_count"] or 0 }}
 
 </span>
-
 </td>
 
 <td class="time">
@@ -2169,16 +2199,6 @@ Actions
 <td class="time">
 
 {{ format_time(e["last_clicked_at"]) }}
-
-</td>
-
-<td>
-
-<span class="badge">
-
-{{ e["page_visit_count"] or 0 }}
-
-</span>
 
 </td>
 
@@ -2644,6 +2664,13 @@ Delete Activity
 Activity History
 </h2>
 
+<p class="small">
+OPEN = the email tracking pixel was requested.
+DESTINATION CLICK = the tracked destination URL was requested,
+recorded, and then opened in the visitor's browser.
+Each event includes its timestamp and request metadata.
+</p>
+
 <div class="table-wrap">
 
 <table>
@@ -2701,7 +2728,7 @@ OPEN
 {% elif row["event"] == "click" %}
 
 <span class="event event-click">
-CLICK
+DESTINATION CLICK
 </span>
 
 {% elif row["event"] == "page_visit" %}
@@ -3029,20 +3056,27 @@ Sent:
 <br><br>
 
 <strong>
+Destination URL:
+</strong>
+
+<div class="url">
+<a
+    href="{{ r["destination_url"] }}"
+    target="_blank"
+    rel="noopener noreferrer"
+>
+{{ r["destination_url"] }}
+</a>
+</div>
+
+<br>
+
+<strong>
 Tracking URL:
 </strong>
 
 <div class="url">
-
-<a
-    href="{{ r["tracking_url"] }}"
-    target="_blank"
->
-
 {{ r["tracking_url"] }}
-
-</a>
-
 </div>
 
 <br>
