@@ -617,7 +617,7 @@ def log_activity(
     # --------------------------------------------------------
     # OPEN
     #
-    # Record every open event and maintain first/last open times.
+    # Count every tracking-pixel request as an open event.
     # --------------------------------------------------------
 
     if event == "open":
@@ -626,7 +626,6 @@ def log_activity(
             UPDATE emails
 
             SET
-
                 first_opened_at =
                     COALESCE(
                         first_opened_at,
@@ -787,12 +786,8 @@ def create_email_html(
     target="_blank"
     rel="noopener noreferrer"
 >
-Open link
+{safe_destination_url}
 </a>
-</p>
-
-<p style="font-size:12px;color:#777;">
-This email contains a tracking link.
 </p>
 
 <img
@@ -2075,9 +2070,9 @@ Tracking
 </h2>
 
 <p class="small">
-Open count comes from the email tracking pixel. Gmail and other mail
-providers may preload or cache images, so an OPEN event is not guaranteed
-to mean the recipient manually read the email.
+Open count is increased whenever the email tracking pixel is requested.
+Gmail and other mail providers may preload or cache images, so an OPEN
+event is not guaranteed to mean the recipient manually read the email.
 </p>
 
 <div class="table-wrap">
@@ -2617,6 +2612,50 @@ Destination URL:
 {% endif %}
 
 
+<div class="info">
+
+<strong>Opens:</strong>
+{{ email["open_count"] or 0 }}
+
+<br>
+
+<strong>First Open:</strong>
+{{ format_time(email["first_opened_at"]) }}
+
+<br>
+
+<strong>Last Open:</strong>
+{{ format_time(email["last_opened_at"]) }}
+
+<br>
+
+<strong>Clicks:</strong>
+{{ email["click_count"] or 0 }}
+
+<br>
+
+<strong>First Click:</strong>
+{{ format_time(email["first_clicked_at"]) }}
+
+<br>
+
+<strong>Last Click:</strong>
+{{ format_time(email["last_clicked_at"]) }}
+
+<br>
+
+<strong>Destination URL:</strong>
+
+{% if email["destination_url"] %}
+<a href="{{ email["destination_url"] }}" target="_blank" rel="noopener noreferrer">
+{{ email["destination_url"] }}
+</a>
+{% else %}
+-
+{% endif %}
+
+</div>
+
 <div class="warning">
 
 Activity history can be deleted below.
@@ -2711,6 +2750,8 @@ Referer
 
 {% for row in activity %}
 
+{% if row["event"] in ("open", "click") %}
+
 <tr>
 
 <td>
@@ -2725,28 +2766,10 @@ Referer
 OPEN
 </span>
 
-{% elif row["event"] == "click" %}
+{% else %}
 
 <span class="event event-click">
 DESTINATION CLICK
-</span>
-
-{% elif row["event"] == "page_visit" %}
-
-<span class="event event-page">
-PAGE VISIT
-</span>
-
-{% elif row["event"] == "form_submit" %}
-
-<span class="event event-form">
-FORM SUBMIT
-</span>
-
-{% else %}
-
-<span class="event">
-{{ row["event"] }}
 </span>
 
 {% endif %}
@@ -2754,42 +2777,31 @@ FORM SUBMIT
 </td>
 
 <td class="time">
-
 {{ format_time(row["timestamp"]) }}
-
 </td>
 
 <td class="small">
-
 {{ row["ip"] or "-" }}
-
 </td>
 
 <td class="small">
-
 {{ row["user_agent"] or "-" }}
-
 </td>
 
 <td class="small">
-
 {{ row["referer"] or "-" }}
-
 </td>
 
 </tr>
+
+{% endif %}
 
 {% else %}
 
 <tr>
 
-<td
-    colspan="6"
-    class="empty"
->
-
-No activity found.
-
+<td colspan="6" class="empty">
+No open/click activity found.
 </td>
 
 </tr>
