@@ -1,23 +1,28 @@
+
+
+
 import os
 import re
 import sqlite3
 import secrets
 import base64
+import json
 
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from html import escape
+from urllib.parse import urlparse
 
 from flask import (
     Flask,
     request,
     jsonify,
     render_template_string,
+    redirect,
 )
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 
@@ -27,8 +32,8 @@ from googleapiclient.discovery import build
 
 APP = Flask(__name__)
 
-HOST = "127.0.0.1"
-PORT = 5000
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", 5000))
 
 DB_FILE = "tracker.db"
 
@@ -48,7 +53,7 @@ SCOPES = [
 
 PUBLIC_URL = os.environ.get(
     "PUBLIC_URL",
-    "https://performer-wooden-pipes-mrna.trycloudflare.com"
+    "https://email-tracker-7tr6.onrender.com"
 ).rstrip("/")
 
 
@@ -176,6 +181,25 @@ def init_db():
     """)
 
     # --------------------------------------------------------
+    # DESTINATION URL MIGRATION
+    # --------------------------------------------------------
+    # Each email can point to any user-supplied HTTP/HTTPS URL.
+    # Existing databases get the column automatically.
+    # --------------------------------------------------------
+
+    try:
+
+        cur.execute("""
+            ALTER TABLE emails
+            ADD COLUMN destination_url TEXT
+        """)
+
+    except sqlite3.OperationalError:
+
+        # Column already exists.
+        pass
+
+    # --------------------------------------------------------
     # ACTIVITY
     # --------------------------------------------------------
 
@@ -282,19 +306,79 @@ def gmail_service():
 
     creds = None
 
-    # --------------------------------------------------------
-    # Existing token
-    # --------------------------------------------------------
+    # ========================================================
+    # 1. LOAD AUTHORIZED TOKEN FROM RENDER ENVIRONMENT
+    # ========================================================
+    #
+    # Render Environment Variable:
+    #
+    # GMAIL_TOKEN_JSON
+    #
+    # Value = COMPLETE contents of token.json
+    #
+    # Example:
+    # {
+    #   "token": "...",
+    #   "refresh_token": "...",
+    #   "token_uri": "https://oauth2.googleapis.com/token",
+    #   "client_id": "...",
+    #   "client_secret": "...",
+    #   "scopes": [
+    #       "https://www.googleapis.com/auth/gmail.send"
+    #   ]
+    # }
+    #
+    # IMPORTANT:
+    # We do NOT call run_local_server() on Render.
+    # That would require a browser and causes the deployment problem.
+    # ========================================================
 
-    if os.path.exists(
-        TOKEN_FILE
-    ):
+    token_json = os.environ.get("GMAIL_TOKEN_JSON")
+
+    if token_json:
+
+        try:
+
+            token_data = json.loads(token_json)
+
+            creds = Credentials.from_authorized_user_info(
+                token_data,
+                SCOPES
+            )
+
+            print(
+                "Gmail token loaded from GMAIL_TOKEN_JSON."
+            )
+
+        except Exception as e:
+
+            print(
+                "Could not load GMAIL_TOKEN_JSON:",
+                e
+            )
+
+            creds = None
+
+    # ========================================================
+    # 2. LOCAL DEVELOPMENT FALLBACK
+    # ========================================================
+    #
+    # This lets the same code work locally if token.json exists.
+    #
+    # Render does not need this when GMAIL_TOKEN_JSON is configured.
+    # ========================================================
+
+    if creds is None and os.path.exists(TOKEN_FILE):
 
         try:
 
             creds = Credentials.from_authorized_user_file(
                 TOKEN_FILE,
                 SCOPES
+            )
+
+            print(
+                "Gmail token loaded from token.json."
             )
 
         except Exception as e:
@@ -306,9 +390,9 @@ def gmail_service():
 
             creds = None
 
-    # --------------------------------------------------------
-    # Refresh token
-    # --------------------------------------------------------
+    # ========================================================
+    # 3. REFRESH EXPIRED TOKEN
+    # ========================================================
 
     if (
         creds
@@ -322,6 +406,10 @@ def gmail_service():
                 Request()
             )
 
+            print(
+                "Gmail token refreshed successfully."
+            )
+
         except Exception as e:
 
             print(
@@ -331,56 +419,40 @@ def gmail_service():
 
             creds = None
 
-    # --------------------------------------------------------
-    # First login
-    # --------------------------------------------------------
+    # ========================================================
+    # 4. NEVER START INTERACTIVE OAUTH ON RENDER
+    # ========================================================
+    #
+    # If this happens, either:
+    #
+    # - GMAIL_TOKEN_JSON is missing
+    # - token.json is invalid
+    # - token.json does not contain a refresh token
+    # - the Google OAuth token has been revoked
+    #
+    # Generate/authorize token.json locally, then put its COMPLETE
+    # contents into the Render variable GMAIL_TOKEN_JSON.
+    # ========================================================
 
     if not creds or not creds.valid:
 
-        if not os.path.exists(
-            CREDENTIALS_FILE
-        ):
-
-            raise FileNotFoundError(
-                "credentials.json nahi mila. "
-                "Google Cloud Console se OAuth Desktop "
-                "credentials download karke app.py ke "
-                "same folder mein rakho."
-            )
-
-        print()
-        print("=" * 60)
-        print("Google OAuth login required")
-        print("=" * 60)
-
-        flow = InstalledAppFlow.from_client_secrets_file(
-            CREDENTIALS_FILE,
-            SCOPES
+        raise RuntimeError(
+            "Gmail authentication failed. "
+            "Set GMAIL_TOKEN_JSON in Render to the complete "
+            "contents of your authorized token.json file. "
+            "Do not use run_local_server() on Render."
         )
 
-        creds = flow.run_local_server(
-            port=0
-        )
-
-        with open(
-            TOKEN_FILE,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
-            f.write(
-                creds.to_json()
-            )
-
-        print(
-            "token.json automatically created."
-        )
+    # ========================================================
+    # 5. BUILD GMAIL API SERVICE
+    # ========================================================
 
     return build(
         "gmail",
         "v1",
         credentials=creds
     )
+
 
 
 # ============================================================
@@ -637,6 +709,21 @@ def log_activity(
 # CREATE EMAIL HTML
 # ============================================================
 
+def valid_destination_url(value):
+
+    value = str(value or "").strip()
+
+    try:
+
+        parsed = urlparse(value)
+
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+    except Exception:
+
+        return False
+
+
 def create_email_html(
     tracking_id,
     message
@@ -660,59 +747,41 @@ def create_email_html(
     )
 
     safe_tracking_url = escape(
-        tracking_url
+        tracking_url,
+        quote=True
     )
 
     safe_pixel_url = escape(
-        pixel_url
+        pixel_url,
+        quote=True
     )
 
     return f"""
 <!doctype html>
-
 <html>
-
 <head>
-
 <meta charset="utf-8">
-
 </head>
-
 <body>
 
-<div style="
-    white-space:pre-wrap;
-    font-family:Arial,sans-serif;
-    line-height:1.5;
-">
-
+<div style="white-space:pre-wrap;font-family:Arial,sans-serif;line-height:1.5;">
 {safe_message}
-
 </div>
 
 <br>
 
 <p>
-
 <a
     href="{safe_tracking_url}"
     target="_blank"
     rel="noopener noreferrer"
 >
-
 Open link
-
 </a>
-
 </p>
 
-<p style="
-    font-size:12px;
-    color:#777;
-">
-
+<p style="font-size:12px;color:#777;">
 This email contains a tracking link.
-
 </p>
 
 <img
@@ -724,7 +793,6 @@ This email contains a tracking link.
 >
 
 </body>
-
 </html>
 """
 
@@ -737,7 +805,8 @@ def send_one_email(
     service,
     recipient,
     subject,
-    message
+    message,
+    destination_url
 ):
 
     tracking_id = secrets.token_urlsafe(
@@ -754,13 +823,15 @@ def send_one_email(
     msg = EmailMessage()
 
     msg["To"] = recipient
-
     msg["From"] = SENDER_EMAIL
-
     msg["Subject"] = subject
 
     msg.set_content(
         message
+        + "\n\nOpen link: "
+        + PUBLIC_URL
+        + "/go/"
+        + tracking_id
     )
 
     msg.add_alternative(
@@ -793,25 +864,24 @@ def send_one_email(
 
     conn.execute("""
         INSERT INTO emails (
-
             tracking_id,
             recipient,
             subject,
             sent_at,
-            gmail_message_id
-
+            gmail_message_id,
+            destination_url
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
     """, (
         tracking_id,
         recipient,
         subject,
         sent_at,
-        gmail_message_id
+        gmail_message_id,
+        destination_url
     ))
 
     conn.commit()
-
     conn.close()
 
     return {
@@ -819,6 +889,7 @@ def send_one_email(
         "tracking_id": tracking_id,
         "recipient": recipient,
         "message_id": gmail_message_id,
+        "destination_url": destination_url,
         "tracking_url":
             PUBLIC_URL
             + "/go/"
@@ -874,13 +945,17 @@ def send_from_dashboard():
         ""
     ).strip()
 
+    destination_url = request.form.get(
+        "destination_url",
+        ""
+    ).strip()
+
     raw_recipients = re.split(
         r"[\n,;]+",
         recipients_text
     )
 
     recipients = []
-
     invalid = []
 
     for item in raw_recipients:
@@ -888,7 +963,6 @@ def send_from_dashboard():
         email = item.strip()
 
         if not email:
-
             continue
 
         if valid_email(email):
@@ -913,10 +987,7 @@ def send_from_dashboard():
         return render_template_string(
             MESSAGE_HTML,
             title="Error",
-            message=(
-                "At least one valid recipient "
-                "email required."
-            ),
+            message="At least one valid recipient email required.",
             back=True
         ), 400
 
@@ -935,6 +1006,18 @@ def send_from_dashboard():
             MESSAGE_HTML,
             title="Error",
             message="Message required.",
+            back=True
+        ), 400
+
+    if not valid_destination_url(destination_url):
+
+        return render_template_string(
+            MESSAGE_HTML,
+            title="Invalid Destination URL",
+            message=(
+                "Enter a complete HTTP/HTTPS URL, for example "
+                "https://example.com/form"
+            ),
             back=True
         ), 400
 
@@ -961,7 +1044,8 @@ def send_from_dashboard():
                 service,
                 recipient,
                 subject,
-                message
+                message,
+                destination_url
             )
 
             results.append(
@@ -1055,32 +1139,36 @@ def track_open(tracking_id):
 )
 def tracked_link(tracking_id):
 
-    if not tracking_exists(
-        tracking_id
-    ):
+    conn = get_db()
+
+    row = conn.execute("""
+        SELECT destination_url
+        FROM emails
+        WHERE tracking_id = ?
+    """, (
+        tracking_id,
+    )).fetchone()
+
+    conn.close()
+
+    if not row or not row["destination_url"]:
 
         return render_template_string(
             MESSAGE_HTML,
             title="Invalid Link",
-            message=(
-                "This tracking link is "
-                "invalid or expired."
-            ),
+            message="This tracking link is invalid or has no destination URL.",
             back=False
         ), 404
 
-    # --------------------------------------------------------
-    # Every request to /go/<tracking_id> = CLICK
-    # --------------------------------------------------------
-
+    # Record the click BEFORE redirecting to the user's URL.
     log_activity(
         tracking_id,
         "click"
     )
 
-    return render_template_string(
-        LANDING_HTML,
-        tracking_id=tracking_id
+    return redirect(
+        row["destination_url"],
+        code=302
     )
 
 
@@ -1364,7 +1452,8 @@ def get_activity(tracking_id):
         SELECT
             recipient,
             subject,
-            sent_at
+            sent_at,
+            destination_url
         FROM emails
         WHERE tracking_id = ?
     """, (
@@ -1865,7 +1954,8 @@ so an open event is not guaranteed proof of
 manual reading.
 
 Click tracking is generated when the unique
-tracking URL is requested.
+tracking URL is requested. After the click is logged,
+the visitor is redirected to the destination URL you entered.
 
 The information form is shown openly on the
 landing page and requires the visitor to
@@ -1933,6 +2023,22 @@ Message
 ></textarea>
 
 
+<label>
+Destination URL
+</label>
+
+<input
+    name="destination_url"
+    type="url"
+    placeholder="https://example.com/form"
+    required
+>
+
+<p class="small">
+This is the URL the recipient will be sent to after the click is recorded.
+</p>
+
+
 <button
     type="submit"
 >
@@ -1970,6 +2076,10 @@ Recipient
 
 <th>
 Subject
+</th>
+
+<th>
+Destination URL
 </th>
 
 <th>
@@ -2016,6 +2126,12 @@ Actions
 
 <td>
 {{ e["subject"] or "-" }}
+</td>
+
+<td class="small">
+<a href="{{ e["destination_url"] }}" target="_blank" rel="noopener noreferrer">
+{{ e["destination_url"] }}
+</a>
 </td>
 
 <td class="time">
@@ -2093,7 +2209,7 @@ Test Link
 <tr>
 
 <td
-    colspan="9"
+    colspan="10"
 >
 
 No emails sent yet.
@@ -2461,6 +2577,20 @@ Sent:
 </strong>
 
 {{ format_time(email["sent_at"]) }}
+
+<br>
+
+<strong>
+Destination URL:
+</strong>
+
+{% if email["destination_url"] %}
+<a href="{{ email["destination_url"] }}" target="_blank" rel="noopener noreferrer">
+{{ email["destination_url"] }}
+</a>
+{% else %}
+-
+{% endif %}
 
 </div>
 
@@ -3590,7 +3720,9 @@ if __name__ == "__main__":
     )
 
     print(
-        TOKEN_FILE
+        "GMAIL_TOKEN_JSON environment variable"
+        if os.environ.get("GMAIL_TOKEN_JSON")
+        else TOKEN_FILE
     )
 
     print()
