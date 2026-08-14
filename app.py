@@ -1,6 +1,3 @@
-
-
-
 import os
 import re
 import sqlite3
@@ -8,17 +5,16 @@ import secrets
 import base64
 import json
 
+
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from html import escape
-from urllib.parse import urlparse
 
 from flask import (
     Flask,
     request,
     jsonify,
     render_template_string,
-    redirect,
 )
 
 from google.auth.transport.requests import Request
@@ -179,25 +175,6 @@ def init_db():
             page_visit_count INTEGER NOT NULL DEFAULT 0
         )
     """)
-
-    # --------------------------------------------------------
-    # DESTINATION URL MIGRATION
-    # --------------------------------------------------------
-    # Each email can point to any user-supplied HTTP/HTTPS URL.
-    # Existing databases get the column automatically.
-    # --------------------------------------------------------
-
-    try:
-
-        cur.execute("""
-            ALTER TABLE emails
-            ADD COLUMN destination_url TEXT
-        """)
-
-    except sqlite3.OperationalError:
-
-        # Column already exists.
-        pass
 
     # --------------------------------------------------------
     # ACTIVITY
@@ -709,21 +686,6 @@ def log_activity(
 # CREATE EMAIL HTML
 # ============================================================
 
-def valid_destination_url(value):
-
-    value = str(value or "").strip()
-
-    try:
-
-        parsed = urlparse(value)
-
-        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
-
-    except Exception:
-
-        return False
-
-
 def create_email_html(
     tracking_id,
     message
@@ -747,41 +709,59 @@ def create_email_html(
     )
 
     safe_tracking_url = escape(
-        tracking_url,
-        quote=True
+        tracking_url
     )
 
     safe_pixel_url = escape(
-        pixel_url,
-        quote=True
+        pixel_url
     )
 
     return f"""
 <!doctype html>
+
 <html>
+
 <head>
+
 <meta charset="utf-8">
+
 </head>
+
 <body>
 
-<div style="white-space:pre-wrap;font-family:Arial,sans-serif;line-height:1.5;">
+<div style="
+    white-space:pre-wrap;
+    font-family:Arial,sans-serif;
+    line-height:1.5;
+">
+
 {safe_message}
+
 </div>
 
 <br>
 
 <p>
+
 <a
     href="{safe_tracking_url}"
     target="_blank"
     rel="noopener noreferrer"
 >
+
 Open link
+
 </a>
+
 </p>
 
-<p style="font-size:12px;color:#777;">
+<p style="
+    font-size:12px;
+    color:#777;
+">
+
 This email contains a tracking link.
+
 </p>
 
 <img
@@ -793,6 +773,7 @@ This email contains a tracking link.
 >
 
 </body>
+
 </html>
 """
 
@@ -805,8 +786,7 @@ def send_one_email(
     service,
     recipient,
     subject,
-    message,
-    destination_url
+    message
 ):
 
     tracking_id = secrets.token_urlsafe(
@@ -823,15 +803,13 @@ def send_one_email(
     msg = EmailMessage()
 
     msg["To"] = recipient
+
     msg["From"] = SENDER_EMAIL
+
     msg["Subject"] = subject
 
     msg.set_content(
         message
-        + "\n\nOpen link: "
-        + PUBLIC_URL
-        + "/go/"
-        + tracking_id
     )
 
     msg.add_alternative(
@@ -864,24 +842,25 @@ def send_one_email(
 
     conn.execute("""
         INSERT INTO emails (
+
             tracking_id,
             recipient,
             subject,
             sent_at,
-            gmail_message_id,
-            destination_url
+            gmail_message_id
+
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?)
     """, (
         tracking_id,
         recipient,
         subject,
         sent_at,
-        gmail_message_id,
-        destination_url
+        gmail_message_id
     ))
 
     conn.commit()
+
     conn.close()
 
     return {
@@ -889,7 +868,6 @@ def send_one_email(
         "tracking_id": tracking_id,
         "recipient": recipient,
         "message_id": gmail_message_id,
-        "destination_url": destination_url,
         "tracking_url":
             PUBLIC_URL
             + "/go/"
@@ -945,17 +923,13 @@ def send_from_dashboard():
         ""
     ).strip()
 
-    destination_url = request.form.get(
-        "destination_url",
-        ""
-    ).strip()
-
     raw_recipients = re.split(
         r"[\n,;]+",
         recipients_text
     )
 
     recipients = []
+
     invalid = []
 
     for item in raw_recipients:
@@ -963,6 +937,7 @@ def send_from_dashboard():
         email = item.strip()
 
         if not email:
+
             continue
 
         if valid_email(email):
@@ -987,7 +962,10 @@ def send_from_dashboard():
         return render_template_string(
             MESSAGE_HTML,
             title="Error",
-            message="At least one valid recipient email required.",
+            message=(
+                "At least one valid recipient "
+                "email required."
+            ),
             back=True
         ), 400
 
@@ -1006,18 +984,6 @@ def send_from_dashboard():
             MESSAGE_HTML,
             title="Error",
             message="Message required.",
-            back=True
-        ), 400
-
-    if not valid_destination_url(destination_url):
-
-        return render_template_string(
-            MESSAGE_HTML,
-            title="Invalid Destination URL",
-            message=(
-                "Enter a complete HTTP/HTTPS URL, for example "
-                "https://example.com/form"
-            ),
             back=True
         ), 400
 
@@ -1044,8 +1010,7 @@ def send_from_dashboard():
                 service,
                 recipient,
                 subject,
-                message,
-                destination_url
+                message
             )
 
             results.append(
@@ -1139,36 +1104,32 @@ def track_open(tracking_id):
 )
 def tracked_link(tracking_id):
 
-    conn = get_db()
-
-    row = conn.execute("""
-        SELECT destination_url
-        FROM emails
-        WHERE tracking_id = ?
-    """, (
-        tracking_id,
-    )).fetchone()
-
-    conn.close()
-
-    if not row or not row["destination_url"]:
+    if not tracking_exists(
+        tracking_id
+    ):
 
         return render_template_string(
             MESSAGE_HTML,
             title="Invalid Link",
-            message="This tracking link is invalid or has no destination URL.",
+            message=(
+                "This tracking link is "
+                "invalid or expired."
+            ),
             back=False
         ), 404
 
-    # Record the click BEFORE redirecting to the user's URL.
+    # --------------------------------------------------------
+    # Every request to /go/<tracking_id> = CLICK
+    # --------------------------------------------------------
+
     log_activity(
         tracking_id,
         "click"
     )
 
-    return redirect(
-        row["destination_url"],
-        code=302
+    return render_template_string(
+        LANDING_HTML,
+        tracking_id=tracking_id
     )
 
 
@@ -1452,8 +1413,7 @@ def get_activity(tracking_id):
         SELECT
             recipient,
             subject,
-            sent_at,
-            destination_url
+            sent_at
         FROM emails
         WHERE tracking_id = ?
     """, (
@@ -1954,8 +1914,7 @@ so an open event is not guaranteed proof of
 manual reading.
 
 Click tracking is generated when the unique
-tracking URL is requested. After the click is logged,
-the visitor is redirected to the destination URL you entered.
+tracking URL is requested.
 
 The information form is shown openly on the
 landing page and requires the visitor to
@@ -2023,22 +1982,6 @@ Message
 ></textarea>
 
 
-<label>
-Destination URL
-</label>
-
-<input
-    name="destination_url"
-    type="url"
-    placeholder="https://example.com/form"
-    required
->
-
-<p class="small">
-This is the URL the recipient will be sent to after the click is recorded.
-</p>
-
-
 <button
     type="submit"
 >
@@ -2076,10 +2019,6 @@ Recipient
 
 <th>
 Subject
-</th>
-
-<th>
-Destination URL
 </th>
 
 <th>
@@ -2126,12 +2065,6 @@ Actions
 
 <td>
 {{ e["subject"] or "-" }}
-</td>
-
-<td class="small">
-<a href="{{ e["destination_url"] }}" target="_blank" rel="noopener noreferrer">
-{{ e["destination_url"] }}
-</a>
 </td>
 
 <td class="time">
@@ -2209,7 +2142,7 @@ Test Link
 <tr>
 
 <td
-    colspan="10"
+    colspan="9"
 >
 
 No emails sent yet.
@@ -2577,20 +2510,6 @@ Sent:
 </strong>
 
 {{ format_time(email["sent_at"]) }}
-
-<br>
-
-<strong>
-Destination URL:
-</strong>
-
-{% if email["destination_url"] %}
-<a href="{{ email["destination_url"] }}" target="_blank" rel="noopener noreferrer">
-{{ email["destination_url"] }}
-</a>
-{% else %}
--
-{% endif %}
 
 </div>
 
