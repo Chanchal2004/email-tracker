@@ -48,7 +48,7 @@ SCOPES = [
 
 PUBLIC_URL = os.environ.get(
     "PUBLIC_URL",
-    "https://performer-wooden-pipes-mrna.trycloudflare.com"
+    "https://email-tracker-7tr6.onrender.com"
 ).rstrip("/")
 
 
