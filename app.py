@@ -1415,7 +1415,13 @@ def get_activity(tracking_id):
         SELECT
             recipient,
             subject,
-            sent_at
+            sent_at,
+            open_count,
+            first_opened_at,
+            last_opened_at,
+            click_count,
+            first_clicked_at,
+            last_clicked_at
         FROM emails
         WHERE tracking_id = ?
     """, (
@@ -3803,5 +3809,4 @@ if __name__ == "__main__":
         port=PORT,
         debug=False,
         threaded=True
-        )
-    
+    )
