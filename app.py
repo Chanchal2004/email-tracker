@@ -708,11 +708,15 @@ def create_email_html(
         + tracking_id
     )
 
+    # A unique query parameter makes the pixel URL unique for this
+    # individual email.  The tracking_id is already unique, but the
+    # extra cache-buster helps when a mail client/proxy caches images.
     pixel_url = (
         PUBLIC_URL
         + "/track/"
         + tracking_id
-        + ".gif"
+        + ".gif?cb="
+        + secrets.token_urlsafe(16)
     )
 
     safe_message = escape(
@@ -766,12 +770,19 @@ Open link
 
 </p>
 
+<!--
+    OPEN TRACKING PIXEL
+    This image is requested when the email client loads remote images.
+    It is intentionally not display:none because some clients/proxies
+    handle hidden images differently.
+-->
 <img
     src="{safe_pixel_url}"
     width="1"
     height="1"
-    style="display:none"
     alt=""
+    border="0"
+    style="display:block;width:1px;height:1px;border:0;margin:0;padding:0"
 >
 
 </body>
@@ -1062,9 +1073,9 @@ GIF_1X1 = (
 )
 def track_open(tracking_id):
 
-    if tracking_exists(
-        tracking_id
-    ):
+    # Every request to this endpoint is an observed OPEN event.
+    # There is deliberately NO click requirement here.
+    if tracking_exists(tracking_id):
 
         log_activity(
             tracking_id,
@@ -1077,22 +1088,23 @@ def track_open(tracking_id):
         mimetype="image/gif"
     )
 
+    # Prevent browser/proxy caching as far as HTTP headers allow.
     response.headers[
         "Cache-Control"
     ] = (
         "no-store, "
         "no-cache, "
         "must-revalidate, "
-        "max-age=0"
+        "proxy-revalidate, "
+        "max-age=0, "
+        "s-maxage=0"
     )
 
-    response.headers[
-        "Pragma"
-    ] = "no-cache"
-
-    response.headers[
-        "Expires"
-    ] = "0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    response.headers["ETag"] = '"' + secrets.token_urlsafe(16) + '"'
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Content-Disposition"] = "inline"
 
     return response
 
