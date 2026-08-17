@@ -1,6 +1,7 @@
 import os
 import re
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import secrets
 import base64
 import json
@@ -33,7 +34,7 @@ APP = Flask(__name__)
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 5000))
 
-DB_FILE = "tracker.db"
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 CREDENTIALS_FILE = "credentials.json"
 TOKEN_FILE = "token.json"
@@ -109,22 +110,17 @@ def dt_to_display(dt):
 # ============================================================
 
 def get_db():
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Add your Render PostgreSQL "
+            "connection string to the Render Environment Variables."
+        )
 
-    conn = sqlite3.connect(
-        DB_FILE,
-        timeout=30
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=RealDictCursor,
+        connect_timeout=10
     )
-
-    conn.row_factory = sqlite3.Row
-
-    conn.execute(
-        "PRAGMA journal_mode=WAL"
-    )
-
-    conn.execute(
-        "PRAGMA foreign_keys=ON"
-    )
-
     return conn
 
 
@@ -146,7 +142,7 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS emails (
 
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
 
             tracking_id TEXT UNIQUE NOT NULL,
 
@@ -185,7 +181,7 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS activity (
 
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
 
             tracking_id TEXT NOT NULL,
 
@@ -215,7 +211,7 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS form_submissions (
 
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
 
             tracking_id TEXT NOT NULL,
 
@@ -271,10 +267,7 @@ def init_db():
 
     conn.close()
 
-    print(
-        "Database ready:",
-        DB_FILE
-    )
+    print("Database ready: PostgreSQL")
 
 
 # ============================================================
@@ -534,7 +527,7 @@ def tracking_exists(tracking_id):
     row = conn.execute("""
         SELECT tracking_id
         FROM emails
-        WHERE tracking_id = ?
+        WHERE tracking_id = %s
     """, (
         tracking_id,
     )).fetchone()
@@ -560,7 +553,7 @@ def log_activity(
     row = conn.execute("""
         SELECT tracking_id
         FROM emails
-        WHERE tracking_id = ?
+        WHERE tracking_id = %s
     """, (
         tracking_id,
     )).fetchone()
@@ -586,7 +579,7 @@ def log_activity(
             referer
 
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s)
     """, (
         tracking_id,
         event,
@@ -613,15 +606,15 @@ def log_activity(
                 first_opened_at =
                     COALESCE(
                         first_opened_at,
-                        ?
+                        %s
                     ),
 
-                last_opened_at = ?,
+                last_opened_at = %s,
 
                 open_count =
                     open_count + 1
 
-            WHERE tracking_id = ?
+            WHERE tracking_id = %s
         """, (
             now,
             now,
@@ -642,15 +635,15 @@ def log_activity(
                 first_clicked_at =
                     COALESCE(
                         first_clicked_at,
-                        ?
+                        %s
                     ),
 
-                last_clicked_at = ?,
+                last_clicked_at = %s,
 
                 click_count =
                     click_count + 1
 
-            WHERE tracking_id = ?
+            WHERE tracking_id = %s
         """, (
             now,
             now,
@@ -671,15 +664,15 @@ def log_activity(
                 first_page_visit_at =
                     COALESCE(
                         first_page_visit_at,
-                        ?
+                        %s
                     ),
 
-                last_page_visit_at = ?,
+                last_page_visit_at = %s,
 
                 page_visit_count =
                     page_visit_count + 1
 
-            WHERE tracking_id = ?
+            WHERE tracking_id = %s
         """, (
             now,
             now,
@@ -708,15 +701,11 @@ def create_email_html(
         + tracking_id
     )
 
-    # A unique query parameter makes the pixel URL unique for this
-    # individual email.  The tracking_id is already unique, but the
-    # extra cache-buster helps when a mail client/proxy caches images.
     pixel_url = (
         PUBLIC_URL
         + "/track/"
         + tracking_id
-        + ".gif?cb="
-        + secrets.token_urlsafe(16)
+        + ".gif"
     )
 
     safe_message = escape(
@@ -770,19 +759,12 @@ Open link
 
 </p>
 
-<!--
-    OPEN TRACKING PIXEL
-    This image is requested when the email client loads remote images.
-    It is intentionally not display:none because some clients/proxies
-    handle hidden images differently.
--->
 <img
     src="{safe_pixel_url}"
     width="1"
     height="1"
+    style="display:none"
     alt=""
-    border="0"
-    style="display:block;width:1px;height:1px;border:0;margin:0;padding:0"
 >
 
 </body>
@@ -863,7 +845,7 @@ def send_one_email(
             gmail_message_id
 
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s)
     """, (
         tracking_id,
         recipient,
@@ -1073,9 +1055,9 @@ GIF_1X1 = (
 )
 def track_open(tracking_id):
 
-    # Every request to this endpoint is an observed OPEN event.
-    # There is deliberately NO click requirement here.
-    if tracking_exists(tracking_id):
+    if tracking_exists(
+        tracking_id
+    ):
 
         log_activity(
             tracking_id,
@@ -1088,23 +1070,22 @@ def track_open(tracking_id):
         mimetype="image/gif"
     )
 
-    # Prevent browser/proxy caching as far as HTTP headers allow.
     response.headers[
         "Cache-Control"
     ] = (
         "no-store, "
         "no-cache, "
         "must-revalidate, "
-        "proxy-revalidate, "
-        "max-age=0, "
-        "s-maxage=0"
+        "max-age=0"
     )
 
-    response.headers["Pragma"] = "no-cache"
-    response.headers["Expires"] = "0"
-    response.headers["ETag"] = '"' + secrets.token_urlsafe(16) + '"'
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Content-Disposition"] = "inline"
+    response.headers[
+        "Pragma"
+    ] = "no-cache"
+
+    response.headers[
+        "Expires"
+    ] = "0"
 
     return response
 
@@ -1303,7 +1284,7 @@ def form_submit(tracking_id):
             referer
 
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
     """, (
         tracking_id,
         name,
@@ -1330,7 +1311,7 @@ def form_submit(tracking_id):
             referer
 
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s)
     """, (
         tracking_id,
         "form_submit",
@@ -1356,7 +1337,6 @@ def form_submit(tracking_id):
 # Shows:
 #   1. Activity history
 #   2. Form submissions
-#   3. Delete Activity button
 # ============================================================
 
 @APP.get(
@@ -1392,7 +1372,7 @@ def get_activity(tracking_id):
             user_agent,
             referer
         FROM activity
-        WHERE tracking_id = ?
+        WHERE tracking_id = %s
         ORDER BY id ASC
     """, (
         tracking_id,
@@ -1413,7 +1393,7 @@ def get_activity(tracking_id):
             user_agent,
             referer
         FROM form_submissions
-        WHERE tracking_id = ?
+        WHERE tracking_id = %s
         ORDER BY id DESC
     """, (
         tracking_id,
@@ -1435,7 +1415,7 @@ def get_activity(tracking_id):
             first_clicked_at,
             last_clicked_at
         FROM emails
-        WHERE tracking_id = ?
+        WHERE tracking_id = %s
     """, (
         tracking_id,
     )).fetchone()
@@ -1451,17 +1431,6 @@ def get_activity(tracking_id):
         format_time=display_time
     )
 
-
-# ============================================================
-# DELETE ACTIVITY
-#
-# IMPORTANT:
-# This deletes only activity rows.
-#
-# It does NOT delete:
-#   - email record
-#   - tracking ID
-#   - form submissions
 
 # ============================================================
 # DOWNLOAD ACTIVITY + FORM SUBMISSION REPORT
@@ -1486,20 +1455,20 @@ def download_activity_report(tracking_id):
     email_row = conn.execute("""
         SELECT *
         FROM emails
-        WHERE tracking_id = ?
+        WHERE tracking_id = %s
     """, (tracking_id,)).fetchone()
 
     activity_rows = conn.execute("""
         SELECT id, event, timestamp, ip, user_agent, referer
         FROM activity
-        WHERE tracking_id = ?
+        WHERE tracking_id = %s
         ORDER BY id ASC
     """, (tracking_id,)).fetchall()
 
     submission_rows = conn.execute("""
         SELECT id, name, phone, email, submitted_at, ip, user_agent, referer
         FROM form_submissions
-        WHERE tracking_id = ?
+        WHERE tracking_id = %s
         ORDER BY id ASC
     """, (tracking_id,)).fetchall()
 
@@ -1567,50 +1536,6 @@ def download_activity_report(tracking_id):
     return response
 
 
-# ============================================================
-
-@APP.post(
-    "/api/activity/<tracking_id>/delete"
-)
-def delete_activity(tracking_id):
-
-    if not tracking_exists(
-        tracking_id
-    ):
-
-        return render_template_string(
-            MESSAGE_HTML,
-            title="Invalid Tracking ID",
-            message=(
-                "This tracking ID is invalid."
-            ),
-            back=True
-        ), 404
-
-    conn = get_db()
-
-    conn.execute("""
-        DELETE FROM activity
-        WHERE tracking_id = ?
-    """, (
-        tracking_id,
-    ))
-
-    conn.commit()
-
-    conn.close()
-
-    return render_template_string(
-        MESSAGE_HTML,
-        title="Activity Deleted",
-        message=(
-            "Activity history for this email "
-            "has been deleted successfully. "
-            "The email record and form submissions "
-            "were not deleted."
-        ),
-        back=True
-    )
 
 
 # ============================================================
@@ -1646,7 +1571,7 @@ def get_submissions(tracking_id):
             user_agent,
             referer
         FROM form_submissions
-        WHERE tracking_id = ?
+        WHERE tracking_id = %s
         ORDER BY id DESC
     """, (
         tracking_id,
@@ -2689,37 +2614,7 @@ Last Click:
 {% endif %}
 
 
-<div class="warning">
-
-Activity history can be deleted below.
-
-Deleting activity does not delete the
-email tracking record or submitted
-form data.
-
-</div>
-
-
 <div class="button-row">
-
-<form
-    method="POST"
-    action="/api/activity/{{ tracking_id }}/delete"
-    onsubmit="return confirm(
-        'Delete all activity history for this email?'
-    );"
->
-
-<button
-    type="submit"
-    class="delete"
->
-
-Delete Activity
-
-</button>
-
-</form>
 
 <a
     class="action"
@@ -3809,7 +3704,7 @@ if __name__ == "__main__":
     )
 
     print(
-        DB_FILE
+        "PostgreSQL"
     )
 
     print()
