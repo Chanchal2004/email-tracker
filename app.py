@@ -109,6 +109,38 @@ def dt_to_display(dt):
 # DATABASE
 # ============================================================
 
+class DatabaseConnection:
+    """Small compatibility wrapper for the existing database code.
+
+    psycopg2 connections do not have .execute(). The original app uses
+    conn.execute(...), so this wrapper forwards execute() to one
+    RealDictCursor while preserving commit(), cursor(), and close().
+    """
+
+    def __init__(self, connection):
+        self._connection = connection
+        self._cursor = connection.cursor()
+
+    def execute(self, *args, **kwargs):
+        self._cursor.execute(*args, **kwargs)
+        return self._cursor
+
+    def cursor(self):
+        return self._cursor
+
+    def commit(self):
+        return self._connection.commit()
+
+    def rollback(self):
+        return self._connection.rollback()
+
+    def close(self):
+        try:
+            self._cursor.close()
+        finally:
+            self._connection.close()
+
+
 def get_db():
     if not DATABASE_URL:
         raise RuntimeError(
@@ -121,7 +153,8 @@ def get_db():
         cursor_factory=RealDictCursor,
         connect_timeout=10
     )
-    return conn
+
+    return DatabaseConnection(conn)
 
 
 def init_db():
