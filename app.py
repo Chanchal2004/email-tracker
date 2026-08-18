@@ -12,6 +12,7 @@ import io
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from html import escape
+from urllib.parse import urlparse
 
 from flask import (
     Flask,
@@ -109,6 +110,38 @@ def dt_to_display(dt):
 # DATABASE
 # ============================================================
 
+class DatabaseConnection:
+    """Small compatibility wrapper for the existing database code.
+
+    psycopg2 connections do not have .execute(). The original app uses
+    conn.execute(...), so this wrapper forwards execute() to one
+    RealDictCursor while preserving commit(), cursor(), and close().
+    """
+
+    def __init__(self, connection):
+        self._connection = connection
+        self._cursor = connection.cursor()
+
+    def execute(self, *args, **kwargs):
+        self._cursor.execute(*args, **kwargs)
+        return self._cursor
+
+    def cursor(self):
+        return self._cursor
+
+    def commit(self):
+        return self._connection.commit()
+
+    def rollback(self):
+        return self._connection.rollback()
+
+    def close(self):
+        try:
+            self._cursor.close()
+        finally:
+            self._connection.close()
+
+
 def get_db():
     if not DATABASE_URL:
         raise RuntimeError(
@@ -121,7 +154,8 @@ def get_db():
         cursor_factory=RealDictCursor,
         connect_timeout=10
     )
-    return conn
+
+    return DatabaseConnection(conn)
 
 
 def init_db():
@@ -177,6 +211,22 @@ def init_db():
     # --------------------------------------------------------
     # ACTIVITY
     # --------------------------------------------------------
+
+
+    # --------------------------------------------------------
+    # SAFE MIGRATIONS: existing PostgreSQL data is preserved.
+    # campaign_id = parent/campaign ID
+    # tracking_id = child/email ID
+    # --------------------------------------------------------
+    cur.execute("ALTER TABLE emails ADD COLUMN IF NOT EXISTS campaign_id TEXT")
+    cur.execute("ALTER TABLE emails ADD COLUMN IF NOT EXISTS recipient_name TEXT")
+    cur.execute("ALTER TABLE emails ADD COLUMN IF NOT EXISTS recipient_email TEXT")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_emails_campaign ON emails(campaign_id)")
+    cur.execute("""
+        UPDATE emails
+        SET campaign_id = COALESCE(campaign_id, 'legacy')
+        WHERE campaign_id IS NULL
+    """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS activity (
@@ -269,15 +319,6 @@ def init_db():
 
     print("Database ready: PostgreSQL")
 
-
-
-# Safe schema additions for campaign reporting.
-def ensure_report_columns():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("ALTER TABLE emails ADD COLUMN IF NOT EXISTS recipient_name TEXT")
-    conn.commit()
-    conn.close()
 
 # ============================================================
 # GMAIL AUTH
@@ -717,67 +758,53 @@ def create_email_html(
         + ".gif"
     )
 
-    safe_message = escape(
-        message
-    )
+    # Preserve line breaks and make plain http(s) URLs clickable.
+    # Each detected URL is routed through this email's tracking ID.
+    url_re = re.compile(r"(https?://[^\s<]+)")
+    parts = []
+    last = 0
 
-    safe_tracking_url = escape(
-        tracking_url
-    )
+    for match in url_re.finditer(message):
+        parts.append(escape(message[last:match.start()]))
+        raw_url = match.group(1).rstrip(".,);]}")
+        safe_url_text = escape(raw_url)
+        parts.append(
+            '<a href="' + escape(
+                PUBLIC_URL + "/go/" + tracking_id
+            ) + '" style="color:#1261a0 !important;'
+            'text-decoration:underline !important;"'
+            ' target="_blank">' + safe_url_text + '</a>'
+        )
+        last = match.end()
 
-    safe_pixel_url = escape(
-        pixel_url
-    )
+    parts.append(escape(message[last:]))
+    safe_message = "".join(parts).replace("\n", "<br>")
+
+    safe_tracking_url = escape(tracking_url)
+    safe_pixel_url = escape(pixel_url)
 
     return f"""
 <!doctype html>
-
 <html>
-
 <head>
-
 <meta charset="utf-8">
-
+<meta name="viewport" content="width=device-width,initial-scale=1">
 </head>
-
-<body>
-
-<div style="
-    white-space:pre-wrap;
-    font-family:Arial,sans-serif;
-    line-height:1.5;
-">
-
-{safe_message}
-
-</div>
-
-<br>
+<body style="margin:0;padding:0;font-family:Arial,sans-serif;line-height:1.5;">
+<div>{safe_message}</div>
 
 <p>
-
-<a
-    href="{safe_tracking_url}"
-    target="_blank"
-    rel="noopener noreferrer"
->
-
-Open link
-
+<a href="{safe_tracking_url}"
+   target="_blank"
+   style="color:#1261a0 !important;text-decoration:underline !important;font-weight:600;">
+   Open link
 </a>
-
 </p>
 
-<img
-    src="{safe_pixel_url}"
-    width="1"
-    height="1"
-    style="display:none"
-    alt=""
->
-
+<img src="{safe_pixel_url}" width="1" height="1"
+     style="display:block;width:1px;height:1px;border:0;opacity:0;"
+     alt="">
 </body>
-
 </html>
 """
 
@@ -790,7 +817,9 @@ def send_one_email(
     service,
     recipient,
     subject,
-    message
+    message,
+    campaign_id=None,
+    recipient_name=""
 ):
 
     tracking_id = secrets.token_urlsafe(
@@ -846,17 +875,21 @@ def send_one_email(
 
     conn.execute("""
         INSERT INTO emails (
-
             tracking_id,
+            campaign_id,
             recipient,
+            recipient_name,
+            recipient_email,
             subject,
             sent_at,
             gmail_message_id
-
         )
-        VALUES (%s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
     """, (
         tracking_id,
+        campaign_id or "legacy",
+        recipient,
+        recipient_name or "",
         recipient,
         subject,
         sent_at,
@@ -872,6 +905,7 @@ def send_one_email(
         "tracking_id": tracking_id,
         "recipient": recipient,
         "message_id": gmail_message_id,
+        "campaign_id": campaign_id or "legacy",
         "tracking_url":
             PUBLIC_URL
             + "/go/"
@@ -1671,6 +1705,286 @@ def get_emails():
     return jsonify(output)
 
 
+
+# ============================================================
+# CAMPAIGN REPORT
+# Parent = campaign_id
+# Child  = tracking_id
+# ============================================================
+
+def _report_rows():
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT
+            e.id,
+            e.campaign_id,
+            e.tracking_id,
+            e.recipient,
+            e.recipient_name,
+            e.recipient_email,
+            e.subject,
+            e.sent_at,
+            e.open_count,
+            e.first_opened_at,
+            e.last_opened_at,
+            e.click_count,
+            e.first_clicked_at,
+            e.last_clicked_at,
+            COALESCE(
+                (
+                    SELECT COUNT(*)
+                    FROM activity a
+                    WHERE a.tracking_id = e.tracking_id
+                      AND a.event = 'open'
+                ), 0
+            ) AS total_open_events,
+            COALESCE(
+                (
+                    SELECT COUNT(DISTINCT
+                        COALESCE(a.ip,'') || '|' ||
+                        COALESCE(a.user_agent,'')
+                    )
+                    FROM activity a
+                    WHERE a.tracking_id = e.tracking_id
+                      AND a.event = 'open'
+                ), 0
+            ) AS unique_open_signatures,
+            COALESCE(
+                (
+                    SELECT COUNT(DISTINCT
+                        COALESCE(a.ip,'') || '|' ||
+                        COALESCE(a.user_agent,'')
+                    )
+                    FROM activity a
+                    WHERE a.tracking_id = e.tracking_id
+                      AND a.event = 'click'
+                ), 0
+            ) AS unique_click_signatures
+        FROM emails e
+        ORDER BY e.id DESC
+    """).fetchall()
+    conn.close()
+    return rows
+
+
+@APP.get("/report")
+def campaign_report():
+    rows = _report_rows()
+
+    # Overall summary across every email ever sent.
+    sent = len(rows)
+    opened = sum(1 for r in rows if (r["open_count"] or 0) > 0)
+    clicked = sum(1 for r in rows if (r["click_count"] or 0) > 0)
+    total_opens = sum(int(r["open_count"] or 0) for r in rows)
+    total_clicks = sum(int(r["click_count"] or 0) for r in rows)
+
+    return render_template_string(
+        CAMPAIGN_REPORT_HTML,
+        rows=rows,
+        sent=sent,
+        opened=opened,
+        not_opened=sent-opened,
+        clicked=clicked,
+        not_clicked=sent-clicked,
+        total_opens=total_opens,
+        total_clicks=total_clicks,
+        open_rate=round(opened / sent * 100, 1) if sent else 0,
+        click_rate=round(clicked / sent * 100, 1) if sent else 0,
+        format_time=display_time
+    )
+
+
+@APP.get("/report.csv")
+def campaign_report_csv():
+    rows = _report_rows()
+
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow([
+        "Parent Campaign ID",
+        "Child Tracking ID",
+        "Name",
+        "Email",
+        "Subject",
+        "Sent",
+        "Opened",
+        "Total Opens",
+        "Unique Open Signatures",
+        "Clicked",
+        "Total Clicks",
+        "Unique Click Signatures",
+        "First Open",
+        "Last Open",
+        "First Click",
+        "Last Click",
+        "Possible Forward"
+    ])
+
+    for r in rows:
+        unique_opens = int(r["unique_open_signatures"] or 0)
+        possible_forward = "POSSIBLE" if unique_opens > 1 else ""
+        writer.writerow([
+            r["campaign_id"] or "legacy",
+            r["tracking_id"],
+            r["recipient_name"] or "",
+            r["recipient_email"] or r["recipient"],
+            r["subject"] or "",
+            display_time(r["sent_at"]),
+            "YES" if (r["open_count"] or 0) > 0 else "NO",
+            r["open_count"] or 0,
+            unique_opens,
+            "YES" if (r["click_count"] or 0) > 0 else "NO",
+            r["click_count"] or 0,
+            int(r["unique_click_signatures"] or 0),
+            display_time(r["first_opened_at"]),
+            display_time(r["last_opened_at"]),
+            display_time(r["first_clicked_at"]),
+            display_time(r["last_clicked_at"]),
+            possible_forward
+        ])
+
+    response = APP.response_class(
+        output.getvalue(),
+        mimetype="text/csv"
+    )
+    response.headers["Content-Disposition"] = (
+        'attachment; filename="email_campaign_report.csv"'
+    )
+    return response
+
+
+CAMPAIGN_REPORT_HTML = """
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Email Campaign Report</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f4f6f9;font-family:Arial,sans-serif;color:#222}
+.wrap{max-width:1700px;margin:auto;padding:22px}
+h1{margin:0 0 6px}
+.muted{color:#6b7280;font-size:13px}
+.top{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}
+.btn{display:inline-block;background:#222;color:#fff;text-decoration:none;padding:10px 14px;border-radius:8px}
+.cards{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin:18px 0}
+.card{background:#fff;border-radius:12px;padding:16px;box-shadow:0 2px 12px rgba(0,0,0,.06)}
+.num{font-size:28px;font-weight:700;margin-top:7px}
+.chart{background:#fff;padding:18px;border-radius:12px;margin-bottom:18px}
+.bar{height:22px;background:#e5e7eb;border-radius:11px;overflow:hidden;margin:7px 0 13px}
+.fill{height:100%;background:#2563eb}
+.controls{margin:16px 0}
+.controls button{border:1px solid #ddd;background:#fff;border-radius:7px;padding:8px 12px;margin:3px;cursor:pointer}
+.table-wrap{overflow:auto;background:#fff;border-radius:12px}
+table{width:100%;border-collapse:collapse;min-width:1500px}
+th,td{padding:10px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}
+th{background:#f3f4f6;position:sticky;top:0;z-index:1}
+.yes{color:#15803d;font-weight:700}
+.no{color:#b91c1c;font-weight:700}
+.forward{color:#b45309;font-weight:700}
+.small{font-size:12px;color:#6b7280}
+@media(max-width:1000px){.cards{grid-template-columns:repeat(2,1fr)}.wrap{padding:12px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Email Campaign Report</h1>
+<div class="muted">One screen: every sent email, opened/not opened, clicked/not clicked, activity and download.</div>
+
+<div class="top">
+<a class="btn" href="/">← Dashboard</a>
+<a class="btn" href="/report.csv">⬇ Download CSV</a>
+</div>
+
+<div class="cards">
+<div class="card"><div class="muted">Sent</div><div class="num">{{ sent }}</div></div>
+<div class="card"><div class="muted">Opened</div><div class="num">{{ opened }}</div></div>
+<div class="card"><div class="muted">Not Opened</div><div class="num">{{ not_opened }}</div></div>
+<div class="card"><div class="muted">Total Opens</div><div class="num">{{ total_opens }}</div></div>
+<div class="card"><div class="muted">Clicked</div><div class="num">{{ clicked }}</div></div>
+<div class="card"><div class="muted">Total Clicks</div><div class="num">{{ total_clicks }}</div></div>
+</div>
+
+<div class="chart">
+<strong>Open rate — {{ open_rate }}%</strong>
+<div class="bar"><div class="fill" style="width:{{ open_rate }}%"></div></div>
+<strong>Click rate — {{ click_rate }}%</strong>
+<div class="bar"><div class="fill" style="width:{{ click_rate }}%"></div></div>
+<div class="small">Forwarding cannot be directly confirmed by Gmail/Outlook. “Possible” is only a heuristic based on different observed tracking signatures.</div>
+</div>
+
+<div class="controls">
+<button onclick="filterRows('all')">All</button>
+<button onclick="filterRows('opened')">Opened</button>
+<button onclick="filterRows('not-opened')">Not Opened</button>
+<button onclick="filterRows('clicked')">Clicked</button>
+<button onclick="filterRows('not-clicked')">Not Clicked</button>
+</div>
+
+<div class="table-wrap">
+<table id="reportTable">
+<thead>
+<tr>
+<th>Parent Campaign ID</th>
+<th>Child Tracking ID</th>
+<th>Name</th>
+<th>Email</th>
+<th>Sent</th>
+<th>Opened</th>
+<th>Opens</th>
+<th>Clicked</th>
+<th>Clicks</th>
+<th>First Open</th>
+<th>Last Open</th>
+<th>First Click</th>
+<th>Last Click</th>
+<th>Possible Forward</th>
+</tr>
+</thead>
+<tbody>
+{% for r in rows %}
+<tr data-open="{{ 1 if (r['open_count'] or 0)>0 else 0 }}" data-click="{{ 1 if (r['click_count'] or 0)>0 else 0 }}">
+<td class="small">{{ r['campaign_id'] or 'legacy' }}</td>
+<td class="small">{{ r['tracking_id'] }}</td>
+<td>{{ r['recipient_name'] or '—' }}</td>
+<td>{{ r['recipient_email'] or r['recipient'] }}</td>
+<td class="small">{{ format_time(r['sent_at']) }}</td>
+<td class="{{ 'yes' if (r['open_count'] or 0)>0 else 'no' }}">{{ 'YES' if (r['open_count'] or 0)>0 else 'NO' }}</td>
+<td>{{ r['open_count'] or 0 }}</td>
+<td class="{{ 'yes' if (r['click_count'] or 0)>0 else 'no' }}">{{ 'YES' if (r['click_count'] or 0)>0 else 'NO' }}</td>
+<td>{{ r['click_count'] or 0 }}</td>
+<td class="small">{{ format_time(r['first_opened_at']) }}</td>
+<td class="small">{{ format_time(r['last_opened_at']) }}</td>
+<td class="small">{{ format_time(r['first_clicked_at']) }}</td>
+<td class="small">{{ format_time(r['last_clicked_at']) }}</td>
+<td class="forward">{{ 'POSSIBLE' if (r['unique_open_signatures'] or 0)>1 else '—' }}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+</div>
+<script>
+function filterRows(kind){
+  document.querySelectorAll('#reportTable tbody tr').forEach(row=>{
+    const opened=row.dataset.open==='1';
+    const clicked=row.dataset.click==='1';
+    let show =
+      kind==='all' ||
+      (kind==='opened' && opened) ||
+      (kind==='not-opened' && !opened) ||
+      (kind==='clicked' && clicked) ||
+      (kind==='not-clicked' && !clicked);
+    row.style.display=show?'':'none';
+  });
+}
+</script>
+</body>
+</html>
+"""
+
+
 # ============================================================
 # HEALTH
 # ============================================================
@@ -1964,6 +2278,10 @@ Public URL:
 {{ public_url }}
 
 </div>
+
+<p>
+<a class="action" href="/report">📊 Full Campaign Report</a>
+</p>
 
 <p class="small">
 
@@ -3653,213 +3971,6 @@ You may now continue.
 # ============================================================
 # START APPLICATION
 # ============================================================
-
-
-# ============================================================
-# CAMPAIGN REPORT (ALL RECIPIENTS AT ONCE)
-# ============================================================
-
-def _report_html():
-    return """
-<!doctype html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Email Campaign Report</title>
-<style>
-body{font-family:Arial,sans-serif;background:#f6f7f9;margin:0;color:#202124}
-.wrap{max-width:1500px;margin:0 auto;padding:24px}
-h1{margin:0 0 6px}.muted{color:#6b7280}
-.cards{display:grid;grid-template-columns:repeat(6,minmax(130px,1fr));gap:12px;margin:20px 0}
-.card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:16px}
-.num{font-size:28px;font-weight:700;margin-top:6px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.bar{height:18px;background:#e5e7eb;border-radius:9px;overflow:hidden;margin:8px 0 14px}
-.fill{height:100%;background:#2563eb}
-table{width:100%;border-collapse:collapse;background:#fff;border-radius:12px;overflow:hidden}
-th,td{padding:12px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}
-th{background:#f3f4f6;position:sticky;top:0}
-.yes{color:#15803d;font-weight:700}.no{color:#b91c1c;font-weight:700}
-.btn{display:inline-block;padding:10px 14px;border-radius:8px;background:#111827;color:#fff;text-decoration:none;margin-right:8px}
-.filters{margin:16px 0}.filters button{padding:8px 12px;margin-right:6px;border:1px solid #ddd;background:#fff;border-radius:7px;cursor:pointer}
-@media(max-width:900px){.cards{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.wrap{padding:12px}.table-wrap{overflow-x:auto}}
-</style>
-</head>
-<body>
-<div class="wrap">
-<h1>Email Campaign Report</h1>
-<div class="muted">All sent recipients in one view</div>
-<div style="margin-top:14px">
-<a class="btn" href="/">← Dashboard</a>
-<a class="btn" href="/report.csv">Download CSV</a>
-</div>
-
-<div class="cards">
-<div class="card"><div class="muted">Sent</div><div class="num" id="sent">0</div></div>
-<div class="card"><div class="muted">Opened</div><div class="num" id="opened">0</div></div>
-<div class="card"><div class="muted">Not Opened</div><div class="num" id="notopened">0</div></div>
-<div class="card"><div class="muted">Total Opens</div><div class="num" id="opens">0</div></div>
-<div class="card"><div class="muted">Clicked</div><div class="num" id="clicked">0</div></div>
-<div class="card"><div class="muted">Total Clicks</div><div class="num" id="clicks">0</div></div>
-</div>
-
-<div class="grid">
-<div class="card">
-<h2>Open Rate</h2>
-<div class="num" id="openrate">0%</div>
-<div class="bar"><div class="fill" id="openbar" style="width:0%"></div></div>
-</div>
-<div class="card">
-<h2>Click Rate</h2>
-<div class="num" id="clickrate">0%</div>
-<div class="bar"><div class="fill" id="clickbar" style="width:0%"></div></div>
-</div>
-</div>
-
-<div class="filters">
-<button onclick="filterRows('all')">All</button>
-<button onclick="filterRows('opened')">Opened</button>
-<button onclick="filterRows('not-opened')">Not Opened</button>
-<button onclick="filterRows('clicked')">Clicked</button>
-<button onclick="filterRows('not-clicked')">Not Clicked</button>
-</div>
-
-<div class="table-wrap">
-<table id="report">
-<thead><tr>
-<th>Name / Email</th><th>Sent</th><th>Opened</th><th>Opens</th>
-<th>Clicked</th><th>Clicks</th><th>First Open</th><th>Last Open</th>
-<th>First Click</th><th>Last Click</th><th>Possible Forward</th>
-</tr></thead>
-<tbody id="rows"></tbody>
-</table>
-</div>
-</div>
-<script>
-let DATA=[];
-function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]))}
-function render(filter='all'){
- const body=document.getElementById('rows'); body.innerHTML='';
- DATA.filter(r=>filter==='all'||(filter==='opened'?(r.open_count>0):(filter==='not-opened'?(r.open_count===0):(filter==='clicked'?(r.click_count>0):(filter==='not-clicked'?(r.click_count===0):true)))))
- .forEach(r=>{
-  const name=esc(r.name||'');
-  const display=name ? name+'<div class="muted">'+esc(r.email)+'</div>' : esc(r.email);
-  const tr=document.createElement('tr');
-  tr.innerHTML=`<td>${display}</td>
-  <td>${esc(r.sent_at)}</td>
-  <td class="${r.open_count>0?'yes':'no'}">${r.open_count>0?'YES':'NO'}</td>
-  <td>${r.open_count}</td>
-  <td class="${r.click_count>0?'yes':'no'}">${r.click_count>0?'YES':'NO'}</td>
-  <td>${r.click_count}</td>
-  <td>${esc(r.first_opened_at||'—')}</td>
-  <td>${esc(r.last_opened_at||'—')}</td>
-  <td>${esc(r.first_clicked_at||'—')}</td>
-  <td>${esc(r.last_clicked_at||'—')}</td>
-  <td>${r.possible_forward?'Possible':'—'}</td>`;
-  body.appendChild(tr);
- });
-}
-function filterRows(f){render(f)}
-fetch('/api/report').then(r=>r.json()).then(x=>{
- DATA=x.rows||[];
- const sent=DATA.length, opened=DATA.filter(r=>r.open_count>0).length, clicked=DATA.filter(r=>r.click_count>0).length;
- const opens=DATA.reduce((a,r)=>a+(+r.open_count||0),0), clicks=DATA.reduce((a,r)=>a+(+r.click_count||0),0);
- document.getElementById('sent').textContent=sent;
- document.getElementById('opened').textContent=opened;
- document.getElementById('notopened').textContent=sent-opened;
- document.getElementById('opens').textContent=opens;
- document.getElementById('clicked').textContent=clicked;
- document.getElementById('clicks').textContent=clicks;
- const or=sent?Math.round(opened/sent*100):0, cr=sent?Math.round(clicked/sent*100):0;
- document.getElementById('openrate').textContent=or+'%';
- document.getElementById('clickrate').textContent=cr+'%';
- document.getElementById('openbar').style.width=or+'%';
- document.getElementById('clickbar').style.width=cr+'%';
- render();
-}).catch(e=>document.getElementById('rows').innerHTML='<tr><td colspan="11">Report error: '+esc(e)+'</td></tr>');
-</script>
-</body>
-</html>
-"""
-
-def _split_name_email(value):
-    value = (value or "").strip()
-    m = re.match(r"^\s*(.*?)\s*<([^<>@\s]+@[^<>@\s]+)>\s*$", value)
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
-    return "", value
-
-@APP.get("/report")
-def campaign_report():
-    return render_template_string(_report_html())
-
-@APP.get("/api/report")
-def campaign_report_api():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT tracking_id, recipient, subject, sent_at,
-               first_opened_at, last_opened_at, open_count,
-               first_clicked_at, last_clicked_at, click_count
-        FROM emails
-        ORDER BY id DESC
-    """)
-    rows = cur.fetchall()
-
-    out = []
-    for r in rows:
-        name, email = _split_name_email(r["recipient"])
-        cur.execute("""
-            SELECT COUNT(*) AS c
-            FROM activity
-            WHERE tracking_id=%s
-              AND event='possible_forward'
-        """, (r["tracking_id"],))
-        pf = cur.fetchone()["c"] > 0
-        out.append({
-            "tracking_id": r["tracking_id"],
-            "name": name,
-            "email": email,
-            "subject": r["subject"],
-            "sent_at": r["sent_at"],
-            "first_opened_at": r["first_opened_at"],
-            "last_opened_at": r["last_opened_at"],
-            "open_count": int(r["open_count"] or 0),
-            "first_clicked_at": r["first_clicked_at"],
-            "last_clicked_at": r["last_clicked_at"],
-            "click_count": int(r["click_count"] or 0),
-            "possible_forward": pf
-        })
-    conn.close()
-    return jsonify({"rows": out})
-
-@APP.get("/report.csv")
-def campaign_report_csv():
-    import csv
-    from io import StringIO
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT recipient, subject, sent_at, first_opened_at, last_opened_at,
-               open_count, first_clicked_at, last_clicked_at, click_count
-        FROM emails ORDER BY id DESC
-    """)
-    rows = cur.fetchall()
-    conn.close()
-
-    s = StringIO()
-    w = csv.writer(s)
-    w.writerow(["Name","Email","Subject","Sent","First Open","Last Open",
-                "Opens","First Click","Last Click","Clicks"])
-    for r in rows:
-        name, email = _split_name_email(r["recipient"])
-        w.writerow([name,email,r["subject"],r["sent_at"],r["first_opened_at"],
-                    r["last_opened_at"],r["open_count"],r["first_clicked_at"],
-                    r["last_clicked_at"],r["click_count"]])
-    resp = APP.response_class(s.getvalue(), mimetype="text/csv")
-    resp.headers["Content-Disposition"] = "attachment; filename=email_campaign_report.csv"
-    return resp
-
 
 if __name__ == "__main__":
 
