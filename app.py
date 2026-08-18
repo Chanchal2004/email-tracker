@@ -181,6 +181,8 @@ def init_db():
 
             recipient TEXT NOT NULL,
 
+            recipient_name TEXT,
+
             subject TEXT,
 
             sent_at TEXT,
@@ -203,13 +205,22 @@ def init_db():
 
             last_page_visit_at TEXT,
 
-            page_visit_count INTEGER NOT NULL DEFAULT 0
+            page_visit_count INTEGER NOT NULL DEFAULT 0,
+
+            possible_forward_count INTEGER NOT NULL DEFAULT 0,
+
+            last_possible_forward_at TEXT
         )
     """)
 
     # --------------------------------------------------------
     # ACTIVITY
     # --------------------------------------------------------
+
+    # Safe migrations for existing PostgreSQL data
+    cur.execute("ALTER TABLE emails ADD COLUMN IF NOT EXISTS recipient_name TEXT")
+    cur.execute("ALTER TABLE emails ADD COLUMN IF NOT EXISTS possible_forward_count INTEGER NOT NULL DEFAULT 0")
+    cur.execute("ALTER TABLE emails ADD COLUMN IF NOT EXISTS last_possible_forward_at TEXT")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS activity (
@@ -578,144 +589,94 @@ def log_activity(
     tracking_id,
     event
 ):
-
     now = utc_now()
-
     conn = get_db()
 
     row = conn.execute("""
         SELECT tracking_id
         FROM emails
         WHERE tracking_id = %s
-    """, (
-        tracking_id,
-    )).fetchone()
+    """, (tracking_id,)).fetchone()
 
     if not row:
-
         conn.close()
-
         return False
 
-    # --------------------------------------------------------
-    # Save activity event
-    # --------------------------------------------------------
+    ip = request_ip()
+    ua = request_user_agent()
+    referer = request_referer()
 
+    # Save every observed event.
     conn.execute("""
         INSERT INTO activity (
-
-            tracking_id,
-            event,
-            timestamp,
-            ip,
-            user_agent,
-            referer
-
+            tracking_id, event, timestamp, ip, user_agent, referer
         )
         VALUES (%s, %s, %s, %s, %s, %s)
-    """, (
-        tracking_id,
-        event,
-        now,
-        request_ip(),
-        request_user_agent(),
-        request_referer()
-    ))
-
-    # --------------------------------------------------------
-    # OPEN
-    #
-    # Count every observed tracking-pixel request and keep
-    # first/last observed open timestamps.
-    # --------------------------------------------------------
+    """, (tracking_id, event, now, ip, ua, referer))
 
     if event == "open":
-
         conn.execute("""
             UPDATE emails
-
             SET
-
-                first_opened_at =
-                    COALESCE(
-                        first_opened_at,
-                        %s
-                    ),
-
+                first_opened_at = COALESCE(first_opened_at, %s),
                 last_opened_at = %s,
-
-                open_count =
-                    open_count + 1
-
+                open_count = open_count + 1
             WHERE tracking_id = %s
-        """, (
-            now,
-            now,
-            tracking_id
-        ))
+        """, (now, now, tracking_id))
 
-    # --------------------------------------------------------
-    # CLICK
-    # --------------------------------------------------------
+        # A tracking pixel cannot prove a forward. If a later open arrives
+        # from a materially different client signature, record it only as
+        # POSSIBLE_FORWARD. This is a heuristic, not proof of forwarding.
+        previous = conn.execute("""
+            SELECT ip, user_agent
+            FROM activity
+            WHERE tracking_id = %s
+              AND event = 'open'
+              AND id <> (SELECT MAX(id) FROM activity WHERE tracking_id = %s)
+            ORDER BY id DESC
+            LIMIT 1
+        """, (tracking_id, tracking_id)).fetchone()
+
+        if previous:
+            old_sig = ((previous.get("ip") or "") + "|" + (previous.get("user_agent") or "")).strip()
+            new_sig = ((ip or "") + "|" + (ua or "")).strip()
+            if old_sig and new_sig and old_sig != new_sig:
+                conn.execute("""
+                    INSERT INTO activity (
+                        tracking_id, event, timestamp, ip, user_agent, referer
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (tracking_id, "possible_forward", now, ip, ua, referer))
+                conn.execute("""
+                    UPDATE emails
+                    SET
+                        possible_forward_count = possible_forward_count + 1,
+                        last_possible_forward_at = %s
+                    WHERE tracking_id = %s
+                """, (now, tracking_id))
 
     elif event == "click":
-
         conn.execute("""
             UPDATE emails
-
             SET
-
-                first_clicked_at =
-                    COALESCE(
-                        first_clicked_at,
-                        %s
-                    ),
-
+                first_clicked_at = COALESCE(first_clicked_at, %s),
                 last_clicked_at = %s,
-
-                click_count =
-                    click_count + 1
-
+                click_count = click_count + 1
             WHERE tracking_id = %s
-        """, (
-            now,
-            now,
-            tracking_id
-        ))
-
-    # --------------------------------------------------------
-    # PAGE VISIT
-    # --------------------------------------------------------
+        """, (now, now, tracking_id))
 
     elif event == "page_visit":
-
         conn.execute("""
             UPDATE emails
-
             SET
-
-                first_page_visit_at =
-                    COALESCE(
-                        first_page_visit_at,
-                        %s
-                    ),
-
+                first_page_visit_at = COALESCE(first_page_visit_at, %s),
                 last_page_visit_at = %s,
-
-                page_visit_count =
-                    page_visit_count + 1
-
+                page_visit_count = page_visit_count + 1
             WHERE tracking_id = %s
-        """, (
-            now,
-            now,
-            tracking_id
-        ))
+        """, (now, now, tracking_id))
 
     conn.commit()
-
     conn.close()
-
     return True
 
 
@@ -741,9 +702,26 @@ def create_email_html(
         + ".gif"
     )
 
-    safe_message = escape(
-        message
-    )
+    safe_message = escape(message)
+
+    # Convert plain http/https URLs in the message to clickable tracked links.
+    url_pattern = re.compile(r"https?://[^\s<>]+")
+
+    def linkify(match):
+        url = match.group(0)
+        trailing = ""
+        while url and url[-1] in ".,!?;:)":
+            trailing = url[-1] + trailing
+            url = url[:-1]
+        safe_url = escape(url, quote=True)
+        return (
+            f'<a href="{safe_url}" target="_blank" '
+            f'style="color:#1261a0 !important;text-decoration:underline !important;">'
+            f'{safe_url}</a>{trailing}'
+        )
+
+    safe_message = url_pattern.sub(linkify, safe_message)
+    safe_message = safe_message.replace("\n", "<br>")
 
     safe_tracking_url = escape(
         tracking_url
@@ -784,6 +762,7 @@ def create_email_html(
     href="{safe_tracking_url}"
     target="_blank"
     rel="noopener noreferrer"
+    style="color:#1261a0 !important;text-decoration:underline !important;font-weight:600;"
 >
 
 Open link
@@ -807,6 +786,18 @@ Open link
 
 
 # ============================================================
+# RECIPIENT PARSING
+# ============================================================
+
+def parse_recipient(value):
+    value = str(value).strip()
+    m = re.match(r"^(.*?)\s*<([^<>\s]+@[^<>\s]+)>$", value)
+    if m:
+        return m.group(2).strip(), m.group(1).strip()
+    return value, ""
+
+
+# ============================================================
 # SEND ONE EMAIL
 # ============================================================
 
@@ -816,6 +807,8 @@ def send_one_email(
     subject,
     message
 ):
+
+    recipient, recipient_name = parse_recipient(recipient)
 
     tracking_id = secrets.token_urlsafe(
         32
@@ -873,6 +866,7 @@ def send_one_email(
 
             tracking_id,
             recipient,
+            recipient_name,
             subject,
             sent_at,
             gmail_message_id
@@ -882,6 +876,7 @@ def send_one_email(
     """, (
         tracking_id,
         recipient,
+        recipient_name,
         subject,
         sent_at,
         gmail_message_id
@@ -962,28 +957,18 @@ def send_from_dashboard():
 
     for item in raw_recipients:
 
-        email = item.strip()
+        item = item.strip()
 
-        if not email:
-
+        if not item:
             continue
 
+        email, _name = parse_recipient(item)
+
         if valid_email(email):
-
-            if email.lower() not in [
-                x.lower()
-                for x in recipients
-            ]:
-
-                recipients.append(
-                    email
-                )
-
+            if item.lower() not in [x.lower() for x in recipients]:
+                recipients.append(item)
         else:
-
-            invalid.append(
-                email
-            )
+            invalid.append(item)
 
     if not recipients:
 
@@ -1446,7 +1431,9 @@ def get_activity(tracking_id):
             last_opened_at,
             click_count,
             first_clicked_at,
-            last_clicked_at
+            last_clicked_at,
+            possible_forward_count,
+            last_possible_forward_at
         FROM emails
         WHERE tracking_id = %s
     """, (
@@ -1521,6 +1508,8 @@ def download_activity_report(tracking_id):
     writer.writerow(["Click Count", email_row["click_count"] or 0])
     writer.writerow(["First Click", display_time(email_row["first_clicked_at"])])
     writer.writerow(["Last Click", display_time(email_row["last_clicked_at"])])
+    writer.writerow(["Possible Forwards", email_row.get("possible_forward_count") or 0])
+    writer.writerow(["Last Possible Forward", display_time(email_row.get("last_possible_forward_at"))])
     writer.writerow([])
 
     writer.writerow(["ACTIVITY"])
@@ -1719,538 +1708,23 @@ def health():
 # ============================================================
 
 DASHBOARD_HTML = """
-
 <!doctype html>
-
 <html>
-
 <head>
-
 <meta charset="utf-8">
-
-<meta
-    name="viewport"
-    content="width=device-width,initial-scale=1"
->
-
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Email Tracker</title>
-
 <style>
-
-* {
-    box-sizing:border-box;
-}
-
-body {
-
-    margin:0;
-
-    padding:25px;
-
-    font-family:Arial,sans-serif;
-
-    background:#f4f6f9;
-
-    color:#222;
-}
-
-.container {
-
-    max-width:1600px;
-
-    margin:auto;
-}
-
-.card {
-
-    background:white;
-
-    border-radius:14px;
-
-    padding:24px;
-
-    margin-bottom:20px;
-
-    box-shadow:
-        0 3px 18px
-        rgba(0,0,0,.07);
-}
-
-h1,
-h2 {
-
-    margin-top:0;
-}
-
-label {
-
-    display:block;
-
-    font-weight:600;
-
-    margin-top:15px;
-
-    margin-bottom:6px;
-}
-
-input,
-textarea {
-
-    width:100%;
-
-    padding:12px;
-
-    border:
-        1px solid #ccc;
-
-    border-radius:8px;
-
-    font-size:15px;
-
-    font-family:inherit;
-}
-
-textarea {
-
-    min-height:140px;
-
-    resize:vertical;
-}
-
-button {
-
-    margin-top:18px;
-
-    padding:12px 22px;
-
-    background:#222;
-
-    color:white;
-
-    border:0;
-
-    border-radius:8px;
-
-    cursor:pointer;
-
-    font-size:15px;
-}
-
-.public-url {
-
-    background:#f0f2f5;
-
-    padding:10px;
-
-    border-radius:7px;
-
-    word-break:break-all;
-
-    font-family:monospace;
-}
-
-.table-wrap {
-
-    overflow-x:auto;
-}
-
-table {
-
-    width:100%;
-
-    border-collapse:collapse;
-
-    min-width:1700px;
-}
-
-th,
-td {
-
-    padding:11px;
-
-    border-bottom:
-        1px solid #ddd;
-
-    text-align:left;
-
-    vertical-align:top;
-}
-
-th {
-
-    background:#f0f0f0;
-}
-
-.badge {
-
-    display:inline-block;
-
-    padding:5px 9px;
-
-    border-radius:6px;
-
-    background:#eee;
-
-    font-weight:600;
-}
-
-.small {
-
-    font-size:12px;
-
-    color:#666;
-
-    line-height:1.5;
-}
-
-.time {
-
-    white-space:nowrap;
-
-    font-size:13px;
-}
-
-a {
-
-    color:#1261a0;
-
-    text-decoration:none;
-}
-
-a:hover {
-
-    text-decoration:underline;
-}
-
-.action {
-
-    display:inline-block;
-
-    padding:7px 10px;
-
-    margin:3px;
-
-    background:#222;
-
-    color:white;
-
-    border-radius:6px;
-
-    font-size:12px;
-}
-
-.action:hover {
-
-    color:white;
-
-    text-decoration:none;
-}
-
+*{box-sizing:border-box} body{margin:0;padding:24px;font-family:Arial,sans-serif;background:#f4f6f9;color:#222}.container{max-width:1700px;margin:auto}.card{background:#fff;border-radius:14px;padding:24px;margin-bottom:20px;box-shadow:0 3px 18px rgba(0,0,0,.07)}input,textarea{width:100%;padding:12px;border:1px solid #ccc;border-radius:8px;font-size:15px;font-family:inherit}textarea{min-height:140px;resize:vertical}label{display:block;font-weight:600;margin:14px 0 6px}button,.action{display:inline-block;margin-top:14px;padding:10px 15px;background:#222;color:#fff;border:0;border-radius:8px;text-decoration:none;cursor:pointer}.public-url{background:#f0f2f5;padding:10px;border-radius:7px;word-break:break-all;font-family:monospace}.table-wrap{overflow-x:auto}table{width:100%;border-collapse:collapse;min-width:1450px}th,td{padding:11px;border-bottom:1px solid #ddd;text-align:left;vertical-align:top}th{background:#f0f0f0}.badge{display:inline-block;padding:5px 9px;border-radius:6px;background:#eee;font-weight:600}.small{font-size:12px;color:#666;line-height:1.5}.time{white-space:nowrap;font-size:13px}.stats{display:grid;grid-template-columns:repeat(5,minmax(140px,1fr));gap:12px}.stat{background:#f6f7f9;border-radius:10px;padding:15px}.stat b{display:block;font-size:24px;margin-top:5px}@media(max-width:800px){body{padding:12px}.card{padding:16px}.stats{grid-template-columns:1fr 1fr}}
 </style>
-
 </head>
-
-<body>
-
-<div class="container">
-
-
-<!-- ======================================================
-     HEADER
-====================================================== -->
-
-<div class="card">
-
-<h1>
-Email Tracker
-</h1>
-
-<p>
-
-<strong>
-From:
-</strong>
-
-{{ sender }}
-
-</p>
-
-<p>
-
-<strong>
-Public URL:
-</strong>
-
-</p>
-
-<div class="public-url">
-
-{{ public_url }}
-
-</div>
-
-<p class="small">
-
-Open tracking is based on the tracking-image
-request. Email providers may preload images,
-so an open event is not guaranteed proof of
-manual reading.
-
-Click tracking is generated when the unique
-tracking URL is requested.
-
-The information form is shown openly on the
-landing page and requires the visitor to
-actively submit it with consent.
-
-</p>
-
-</div>
-
-
-<!-- ======================================================
-     SEND EMAIL
-====================================================== -->
-
-<div class="card">
-
-<h2>
-Send Email
-</h2>
-
-<form
-    method="POST"
-    action="/send"
->
-
-<label>
-Recipients
-</label>
-
-<textarea
-    name="recipients"
-    placeholder="user1@example.com
-user2@example.com
-user3@example.com"
-    required
-></textarea>
-
-<p class="small">
-
-One recipient per line, or use commas.
-
-</p>
-
-
-<label>
-Subject
-</label>
-
-<input
-    name="subject"
-    type="text"
-    placeholder="Subject"
-    required
->
-
-
-<label>
-Message
-</label>
-
-<textarea
-    name="message"
-    placeholder="Write your email..."
-    required
-></textarea>
-
-
-<button
-    type="submit"
->
-
-Send Email
-
-</button>
-
-</form>
-
-</div>
-
-
-<!-- ======================================================
-     TRACKING
-====================================================== -->
-
-<div class="card">
-
-<h2>
-Tracking
-</h2>
-
-<div class="table-wrap">
-
-<table>
-
-<thead>
-
-<tr>
-
-<th>
-Recipient
-</th>
-
-<th>
-Subject
-</th>
-
-<th>
-Sent
-</th>
-
-<th>
-Opens
-</th>
-
-<th>
-Clicks
-</th>
-
-<th>
-First Click
-</th>
-
-<th>
-Last Click
-</th>
-
-<th>
-Page Visits
-</th>
-
-<th>
-Actions
-</th>
-
-</tr>
-
-</thead>
-
-<tbody>
-
-{% for e in emails %}
-
-<tr>
-
-<td>
-{{ e["recipient"] }}
-</td>
-
-<td>
-{{ e["subject"] or "-" }}
-</td>
-
-<td class="time">
-
-{{ format_time(e["sent_at"]) }}
-
-</td>
-
-<td>
-
-<span class="badge">
-
-{{ e["open_count"] or 0 }}
-
-</span>
-
-</td>
-
-<td>
-
-<span class="badge">
-
-{{ e["click_count"] or 0 }}
-
-</span>
-
-</td>
-
-<td class="time">
-
-{{ format_time(e["first_clicked_at"]) }}
-
-</td>
-
-<td class="time">
-
-{{ format_time(e["last_clicked_at"]) }}
-
-</td>
-
-<td>
-
-<span class="badge">
-
-{{ e["page_visit_count"] or 0 }}
-
-</span>
-
-</td>
-
-<td>
-
-<a
-    class="action"
-    href="/api/activity/{{ e["tracking_id"] }}"
-    target="_blank"
->
-View Activity
-</a>
-
-<a
-    class="action"
-    href="/go/{{ e["tracking_id"] }}"
-    target="_blank"
->
-Test Link
-</a>
-
-</td>
-
-</tr>
-
-{% else %}
-
-<tr>
-
-<td
-    colspan="9"
->
-
-No emails sent yet.
-
-</td>
-
-</tr>
-
-{% endfor %}
-
-</tbody>
-
-</table>
-
-</div>
-
-</div>
-
-
-</div>
-
-</body>
-
-</html>
-
+<body><div class="container">
+<div class="card"><h1>Email Tracker</h1><p><b>From:</b> {{ sender }}</p><p><b>Public URL:</b></p><div class="public-url">{{ public_url }}</div><p class="small">Open tracking is based on a tracking-image request and may be affected by provider image preloading/caching. "Possible Forward" is only a heuristic when a later open comes from a different client signature; it is not proof of forwarding.</p></div>
+<div class="card"><h2>Send Email</h2><form method="POST" action="/send"><label>Recipients</label><textarea name="recipients" placeholder="Rahul Sharma <rahul@example.com>\nNeha <neha@example.com>" required></textarea><p class="small">One recipient per line or comma. Optional format: Name &lt;email@example.com&gt;.</p><label>Subject</label><input name="subject" required><label>Message</label><textarea name="message" placeholder="Write your email...\nhttps://example.com" required></textarea><button type="submit">Send Email</button></form></div>
+<div class="card"><h2>Tracking</h2><div class="table-wrap"><table><thead><tr><th>Recipient</th><th>Subject</th><th>Sent</th><th>Opens</th><th>Clicks</th><th>Possible Forwards</th><th>First Open</th><th>Last Open</th><th>First Click</th><th>Last Click</th><th>Actions</th></tr></thead><tbody>
+{% for e in emails %}<tr><td><b>{{ e["recipient_name"] or "-" }}</b><br>{{ e["recipient"] }}</td><td>{{ e["subject"] or "-" }}</td><td class="time">{{ format_time(e["sent_at"]) }}</td><td><span class="badge">{{ e["open_count"] or 0 }}</span></td><td><span class="badge">{{ e["click_count"] or 0 }}</span></td><td><span class="badge">{{ e["possible_forward_count"] or 0 }}</span></td><td class="time">{{ format_time(e["first_opened_at"]) }}</td><td class="time">{{ format_time(e["last_opened_at"]) }}</td><td class="time">{{ format_time(e["first_clicked_at"]) }}</td><td class="time">{{ format_time(e["last_clicked_at"]) }}</td><td><a class="action" href="/api/activity/{{ e["tracking_id"] }}" target="_blank">View Activity</a><a class="action" href="/api/activity/{{ e["tracking_id"] }}/report">Download CSV</a></td></tr>
+{% else %}<tr><td colspan="11">No emails sent yet.</td></tr>{% endfor %}</tbody></table></div></div>
+</div></body></html>
 """
 
 
@@ -2642,6 +2116,22 @@ Last Click:
 
 {{ format_time(email["last_clicked_at"]) }}
 
+<br>
+
+<strong>
+Possible Forwards:
+</strong>
+
+{{ email["possible_forward_count"] or 0 }}
+
+<br>
+
+<strong>
+Last Possible Forward:
+</strong>
+
+{{ format_time(email["last_possible_forward_at"]) }}
+
 </div>
 
 {% endif %}
@@ -2736,6 +2226,9 @@ CLICK
 <span class="event event-page">
 PAGE VISIT
 </span>
+
+{% elif row["event"] == "possible_forward" %}
+<span class="event event-forward">POSSIBLE FORWARD</span>
 
 {% elif row["event"] == "form_submit" %}
 
