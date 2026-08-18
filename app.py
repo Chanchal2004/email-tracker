@@ -221,6 +221,7 @@ def init_db():
     cur.execute("ALTER TABLE emails ADD COLUMN IF NOT EXISTS campaign_id TEXT")
     cur.execute("ALTER TABLE emails ADD COLUMN IF NOT EXISTS recipient_name TEXT")
     cur.execute("ALTER TABLE emails ADD COLUMN IF NOT EXISTS recipient_email TEXT")
+    cur.execute("ALTER TABLE emails ADD COLUMN IF NOT EXISTS message TEXT")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_emails_campaign ON emails(campaign_id)")
     cur.execute("""
         UPDATE emails
@@ -881,10 +882,11 @@ def send_one_email(
             recipient_name,
             recipient_email,
             subject,
+            message,
             sent_at,
             gmail_message_id
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (
         tracking_id,
         campaign_id or "legacy",
@@ -892,6 +894,7 @@ def send_one_email(
         recipient_name or "",
         recipient,
         subject,
+        message,
         sent_at,
         gmail_message_id
     ))
@@ -1039,6 +1042,7 @@ def send_from_dashboard():
         ), 500
 
     results = []
+    campaign_id = secrets.token_urlsafe(12)
 
     for recipient in recipients:
 
@@ -1048,7 +1052,8 @@ def send_from_dashboard():
                 service,
                 recipient,
                 subject,
-                message
+                message,
+                campaign_id=campaign_id
             )
 
             results.append(
@@ -1375,6 +1380,23 @@ def form_submit(tracking_id):
 
 
 # ============================================================
+# DELETE ONE EMAIL + ALL TRACKER DATA
+# ============================================================
+
+@APP.post("/api/email/<tracking_id>/delete")
+def delete_email(tracking_id):
+    conn = get_db()
+    row = conn.execute("SELECT tracking_id FROM emails WHERE tracking_id = %s", (tracking_id,)).fetchone()
+    if not row:
+        conn.close()
+        return render_template_string(MESSAGE_HTML, title="Not Found", message="This email no longer exists in the tracker.", back=True), 404
+    conn.execute("DELETE FROM emails WHERE tracking_id = %s", (tracking_id,))
+    conn.commit()
+    conn.close()
+    return render_template_string(MESSAGE_HTML, title="Deleted", message="The selected email, its activity, form submissions, and report data were deleted from the tracker.", back=True)
+
+
+# ============================================================
 # ACTIVITY PAGE
 #
 # Shows:
@@ -1450,6 +1472,7 @@ def get_activity(tracking_id):
         SELECT
             recipient,
             subject,
+            message,
             sent_at,
             open_count,
             first_opened_at,
@@ -1524,6 +1547,7 @@ def download_activity_report(tracking_id):
     writer.writerow(["Tracking ID", tracking_id])
     writer.writerow(["Recipient", email_row["recipient"]])
     writer.writerow(["Subject", email_row["subject"] or ""])
+    writer.writerow(["Message", email_row["message"] or ""])
     writer.writerow(["Sent At", display_time(email_row["sent_at"])])
     writer.writerow(["Open Count", email_row["open_count"] or 0])
     writer.writerow(["First Open", display_time(email_row["first_opened_at"])])
@@ -1723,6 +1747,7 @@ def _report_rows():
             e.recipient_name,
             e.recipient_email,
             e.subject,
+            e.message,
             e.sent_at,
             e.open_count,
             e.first_opened_at,
@@ -1806,6 +1831,7 @@ def campaign_report_csv():
         "Name",
         "Email",
         "Subject",
+        "Message",
         "Sent",
         "Opened",
         "Total Opens",
@@ -1829,6 +1855,7 @@ def campaign_report_csv():
             r["recipient_name"] or "",
             r["recipient_email"] or r["recipient"],
             r["subject"] or "",
+            r["message"] or "",
             display_time(r["sent_at"]),
             "YES" if (r["open_count"] or 0) > 0 else "NO",
             r["open_count"] or 0,
@@ -1884,6 +1911,8 @@ th{background:#f3f4f6;position:sticky;top:0;z-index:1}
 .no{color:#b91c1c;font-weight:700}
 .forward{color:#b45309;font-weight:700}
 .small{font-size:12px;color:#6b7280}
+.delete-btn{border:0;background:#b42318;color:#fff;padding:8px 11px;border-radius:7px;cursor:pointer;font-weight:700}
+.delete-btn:hover{opacity:.85}
 @media(max-width:1000px){.cards{grid-template-columns:repeat(2,1fr)}.wrap{padding:12px}}
 </style>
 </head>
@@ -1930,6 +1959,7 @@ th{background:#f3f4f6;position:sticky;top:0;z-index:1}
 <th>Child Tracking ID</th>
 <th>Name</th>
 <th>Email</th>
+<th>Message</th>
 <th>Sent</th>
 <th>Opened</th>
 <th>Opens</th>
@@ -1940,6 +1970,7 @@ th{background:#f3f4f6;position:sticky;top:0;z-index:1}
 <th>First Click</th>
 <th>Last Click</th>
 <th>Possible Forward</th>
+<th>Action</th>
 </tr>
 </thead>
 <tbody>
@@ -1949,6 +1980,7 @@ th{background:#f3f4f6;position:sticky;top:0;z-index:1}
 <td class="small">{{ r['tracking_id'] }}</td>
 <td>{{ r['recipient_name'] or '—' }}</td>
 <td>{{ r['recipient_email'] or r['recipient'] }}</td>
+<td class="small" style="max-width:360px;white-space:pre-wrap;word-break:break-word;">{{ r['message'] or '—' }}</td>
 <td class="small">{{ format_time(r['sent_at']) }}</td>
 <td class="{{ 'yes' if (r['open_count'] or 0)>0 else 'no' }}">{{ 'YES' if (r['open_count'] or 0)>0 else 'NO' }}</td>
 <td>{{ r['open_count'] or 0 }}</td>
@@ -1959,6 +1991,7 @@ th{background:#f3f4f6;position:sticky;top:0;z-index:1}
 <td class="small">{{ format_time(r['first_clicked_at']) }}</td>
 <td class="small">{{ format_time(r['last_clicked_at']) }}</td>
 <td class="forward">{{ 'POSSIBLE' if (r['unique_open_signatures'] or 0)>1 else '—' }}</td>
+<td><form method="POST" action="/api/email/{{ r['tracking_id'] }}/delete" onsubmit="return confirm('Delete this email and ALL of its tracker activity/report data? This cannot be undone.');" style="margin:0;"><button type="submit" class="delete-btn">Delete</button></form></td>
 </tr>
 {% endfor %}
 </tbody>
@@ -2510,6 +2543,10 @@ View Activity
 Test Link
 </a>
 
+<form method="POST" action="/api/email/{{ e["tracking_id"] }}/delete" onsubmit="return confirm('Delete this email and ALL of its tracker activity/report data? This cannot be undone.');" style="display:inline;margin:0;">
+    <button type="submit" class="action delete">Delete</button>
+</form>
+
 </td>
 
 </tr>
@@ -2882,6 +2919,9 @@ Subject:
 
 <br>
 
+<strong>Message:</strong>
+<div style="white-space:pre-wrap;word-break:break-word;margin:6px 0 12px;">{{ email["message"] or "-" }}</div>
+
 <strong>
 Sent:
 </strong>
@@ -2949,6 +2989,10 @@ Last Click:
 >
 Download Report (CSV)
 </a>
+
+<form method="POST" action="/api/email/{{ tracking_id }}/delete" onsubmit="return confirm('Delete this email and ALL of its activity/report data? This cannot be undone.');" style="display:inline;margin:0;">
+    <button type="submit" class="action delete">Delete Email + Activity</button>
+</form>
 
 </div>
 
