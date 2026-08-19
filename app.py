@@ -641,10 +641,42 @@ def log_activity(
     ))
 
     # --------------------------------------------------------
+    # OPEN
+    #
+    # Count every observed tracking-pixel request and keep
+    # first/last observed open timestamps.
+    # --------------------------------------------------------
+
+    if event == "open":
+
+        conn.execute("""
+            UPDATE emails
+
+            SET
+
+                first_opened_at =
+                    COALESCE(
+                        first_opened_at,
+                        %s
+                    ),
+
+                last_opened_at = %s,
+
+                open_count =
+                    open_count + 1
+
+            WHERE tracking_id = %s
+        """, (
+            now,
+            now,
+            tracking_id
+        ))
+
+    # --------------------------------------------------------
     # CLICK
     # --------------------------------------------------------
 
-    if event == "click":
+    elif event == "click":
 
         conn.execute("""
             UPDATE emails
@@ -720,6 +752,13 @@ def create_email_html(
         + tracking_id
     )
 
+    pixel_url = (
+        PUBLIC_URL
+        + "/track/"
+        + tracking_id
+        + ".gif"
+    )
+
     # Preserve line breaks and make plain http(s) URLs clickable.
     # Each detected URL is routed through this email's tracking ID.
     url_re = re.compile(r"(https?://[^\s<]+)")
@@ -743,6 +782,7 @@ def create_email_html(
     safe_message = "".join(parts).replace("\n", "<br>")
 
     safe_tracking_url = escape(tracking_url)
+    safe_pixel_url = escape(pixel_url)
 
     return f"""
 <!doctype html>
@@ -762,6 +802,9 @@ def create_email_html(
 </a>
 </p>
 
+<img src="{safe_pixel_url}" width="1" height="1"
+     style="display:block;width:1px;height:1px;border:0;opacity:0;"
+     alt="">
 </body>
 </html>
 """
@@ -854,15 +897,6 @@ def send_one_email(
         message,
         sent_at,
         gmail_message_id
-    ))
-
-    conn.execute("""
-        INSERT INTO activity (
-            tracking_id, event, timestamp, ip, user_agent, referer
-        )
-        VALUES (%s, %s, %s, %s, %s, %s)
-    """, (
-        tracking_id, "not_opened", sent_at, None, "system", "send"
     ))
 
     conn.commit()
@@ -1044,6 +1078,65 @@ def send_from_dashboard():
 # ============================================================
 # 1x1 GIF
 # ============================================================
+
+GIF_1X1 = (
+    b"GIF89a"
+    b"\x01\x00\x01\x00"
+    b"\x80\x00\x00"
+    b"\x00\x00\x00"
+    b"\xff\xff\xff"
+    b"!\xf9\x04\x01"
+    b"\x00\x00\x00\x00"
+    b",\x00\x00\x00\x00"
+    b"\x01\x00\x01\x00"
+    b"\x00\x02\x02"
+    b"D\x01\x00;"
+)
+
+
+# ============================================================
+# EMAIL OPEN TRACKING
+# ============================================================
+
+@APP.get(
+    "/track/<tracking_id>.gif"
+)
+def track_open(tracking_id):
+
+    if tracking_exists(
+        tracking_id
+    ):
+
+        log_activity(
+            tracking_id,
+            "open"
+        )
+
+    response = APP.response_class(
+        GIF_1X1,
+        status=200,
+        mimetype="image/gif"
+    )
+
+    response.headers[
+        "Cache-Control"
+    ] = (
+        "no-store, "
+        "no-cache, "
+        "must-revalidate, "
+        "max-age=0"
+    )
+
+    response.headers[
+        "Pragma"
+    ] = "no-cache"
+
+    response.headers[
+        "Expires"
+    ] = "0"
+
+    return response
+
 
 # ============================================================
 # TRACKING LINK
@@ -1304,24 +1397,6 @@ def delete_email(tracking_id):
 
 
 # ============================================================
-# DELETE ALL EMAILS + ALL TRACKER DATA
-# ============================================================
-
-@APP.post("/api/emails/delete-all")
-def delete_all_emails():
-    conn = get_db()
-    conn.execute("DELETE FROM emails")
-    conn.commit()
-    conn.close()
-    return render_template_string(
-        MESSAGE_HTML,
-        title="Deleted",
-        message="All tracked emails, activity, form submissions, and campaign report data were deleted from the tracker.",
-        back=True
-    )
-
-
-# ============================================================
 # ACTIVITY PAGE
 #
 # Shows:
@@ -1399,6 +1474,9 @@ def get_activity(tracking_id):
             subject,
             message,
             sent_at,
+            open_count,
+            first_opened_at,
+            last_opened_at,
             click_count,
             first_clicked_at,
             last_clicked_at
@@ -1471,6 +1549,9 @@ def download_activity_report(tracking_id):
     writer.writerow(["Subject", email_row["subject"] or ""])
     writer.writerow(["Message", email_row["message"] or ""])
     writer.writerow(["Sent At", display_time(email_row["sent_at"])])
+    writer.writerow(["Open Count", email_row["open_count"] or 0])
+    writer.writerow(["First Open", display_time(email_row["first_opened_at"])])
+    writer.writerow(["Last Open", display_time(email_row["last_opened_at"])])
     writer.writerow(["Click Count", email_row["click_count"] or 0])
     writer.writerow(["First Click", display_time(email_row["first_clicked_at"])])
     writer.writerow(["Last Click", display_time(email_row["last_clicked_at"])])
@@ -1611,10 +1692,19 @@ def get_emails():
             item["sent_at"]
         )
 
-        # Open tracking is disabled. This status means no open
-        # signal is collected; clicks/page visits/forms are tracked.
-        item["open_status"] = "NOT OPENED"
+        # ----------------------------------------------------
+        # First Open / Last Open intentionally NOT returned.
+        # ----------------------------------------------------
 
+        item.pop(
+            "first_opened_at",
+            None
+        )
+
+        item.pop(
+            "last_opened_at",
+            None
+        )
 
         item["first_click_ist"] = display_time(
             item["first_clicked_at"]
@@ -1659,9 +1749,31 @@ def _report_rows():
             e.subject,
             e.message,
             e.sent_at,
+            e.open_count,
+            e.first_opened_at,
+            e.last_opened_at,
             e.click_count,
             e.first_clicked_at,
             e.last_clicked_at,
+            COALESCE(
+                (
+                    SELECT COUNT(*)
+                    FROM activity a
+                    WHERE a.tracking_id = e.tracking_id
+                      AND a.event = 'open'
+                ), 0
+            ) AS total_open_events,
+            COALESCE(
+                (
+                    SELECT COUNT(DISTINCT
+                        COALESCE(a.ip,'') || '|' ||
+                        COALESCE(a.user_agent,'')
+                    )
+                    FROM activity a
+                    WHERE a.tracking_id = e.tracking_id
+                      AND a.event = 'open'
+                ), 0
+            ) AS unique_open_signatures,
             COALESCE(
                 (
                     SELECT COUNT(DISTINCT
@@ -1686,16 +1798,22 @@ def campaign_report():
 
     # Overall summary across every email ever sent.
     sent = len(rows)
+    opened = sum(1 for r in rows if (r["open_count"] or 0) > 0)
     clicked = sum(1 for r in rows if (r["click_count"] or 0) > 0)
+    total_opens = sum(int(r["open_count"] or 0) for r in rows)
     total_clicks = sum(int(r["click_count"] or 0) for r in rows)
 
     return render_template_string(
         CAMPAIGN_REPORT_HTML,
         rows=rows,
         sent=sent,
+        opened=opened,
+        not_opened=sent-opened,
         clicked=clicked,
         not_clicked=sent-clicked,
+        total_opens=total_opens,
         total_clicks=total_clicks,
+        open_rate=round(opened / sent * 100, 1) if sent else 0,
         click_rate=round(clicked / sent * 100, 1) if sent else 0,
         format_time=display_time
     )
@@ -1715,14 +1833,22 @@ def campaign_report_csv():
         "Subject",
         "Message",
         "Sent",
+        "Opened",
+        "Total Opens",
+        "Unique Open Signatures",
         "Clicked",
         "Total Clicks",
         "Unique Click Signatures",
+        "First Open",
+        "Last Open",
         "First Click",
         "Last Click",
+        "Possible Forward"
     ])
 
     for r in rows:
+        unique_opens = int(r["unique_open_signatures"] or 0)
+        possible_forward = "POSSIBLE" if unique_opens > 1 else ""
         writer.writerow([
             r["campaign_id"] or "legacy",
             r["tracking_id"],
@@ -1731,12 +1857,17 @@ def campaign_report_csv():
             r["subject"] or "",
             r["message"] or "",
             display_time(r["sent_at"]),
-            "NOT OPENED",
+            "YES" if (r["open_count"] or 0) > 0 else "NO",
+            r["open_count"] or 0,
+            unique_opens,
             "YES" if (r["click_count"] or 0) > 0 else "NO",
             r["click_count"] or 0,
             int(r["unique_click_signatures"] or 0),
+            display_time(r["first_opened_at"]),
+            display_time(r["last_opened_at"]),
             display_time(r["first_clicked_at"]),
-            display_time(r["last_clicked_at"])
+            display_time(r["last_clicked_at"]),
+            possible_forward
         ])
 
     response = APP.response_class(
@@ -1776,6 +1907,9 @@ h1{margin:0 0 6px}
 table{width:100%;border-collapse:collapse;min-width:1500px}
 th,td{padding:10px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}
 th{background:#f3f4f6;position:sticky;top:0;z-index:1}
+.yes{color:#15803d;font-weight:700}
+.no{color:#b91c1c;font-weight:700}
+.forward{color:#b45309;font-weight:700}
 .small{font-size:12px;color:#6b7280}
 .delete-btn{border:0;background:#b42318;color:#fff;padding:8px 11px;border-radius:7px;cursor:pointer;font-weight:700}
 .delete-btn:hover{opacity:.85}
@@ -1785,7 +1919,7 @@ th{background:#f3f4f6;position:sticky;top:0;z-index:1}
 <body>
 <div class="wrap">
 <h1>Email Campaign Report</h1>
-<div class="muted">Every sent email, click activity, saved message/data and tracker activity.</div>
+<div class="muted">One screen: every sent email, opened/not opened, clicked/not clicked, activity and download.</div>
 
 <div class="top">
 <a class="btn" href="/">← Dashboard</a>
@@ -1794,18 +1928,25 @@ th{background:#f3f4f6;position:sticky;top:0;z-index:1}
 
 <div class="cards">
 <div class="card"><div class="muted">Sent</div><div class="num">{{ sent }}</div></div>
+<div class="card"><div class="muted">Opened</div><div class="num">{{ opened }}</div></div>
+<div class="card"><div class="muted">Not Opened</div><div class="num">{{ not_opened }}</div></div>
+<div class="card"><div class="muted">Total Opens</div><div class="num">{{ total_opens }}</div></div>
 <div class="card"><div class="muted">Clicked</div><div class="num">{{ clicked }}</div></div>
 <div class="card"><div class="muted">Total Clicks</div><div class="num">{{ total_clicks }}</div></div>
 </div>
 
 <div class="chart">
+<strong>Open rate — {{ open_rate }}%</strong>
+<div class="bar"><div class="fill" style="width:{{ open_rate }}%"></div></div>
 <strong>Click rate — {{ click_rate }}%</strong>
 <div class="bar"><div class="fill" style="width:{{ click_rate }}%"></div></div>
-<div class="small">Open tracking is disabled. Clicks, page visits and form submissions are the reliable tracked actions.</div>
+<div class="small">Forwarding cannot be directly confirmed by Gmail/Outlook. “Possible” is only a heuristic based on different observed tracking signatures.</div>
 </div>
 
 <div class="controls">
 <button onclick="filterRows('all')">All</button>
+<button onclick="filterRows('opened')">Opened</button>
+<button onclick="filterRows('not-opened')">Not Opened</button>
 <button onclick="filterRows('clicked')">Clicked</button>
 <button onclick="filterRows('not-clicked')">Not Clicked</button>
 </div>
@@ -1820,29 +1961,36 @@ th{background:#f3f4f6;position:sticky;top:0;z-index:1}
 <th>Email</th>
 <th>Message</th>
 <th>Sent</th>
-<th>Open Status</th>
+<th>Opened</th>
+<th>Opens</th>
 <th>Clicked</th>
 <th>Clicks</th>
+<th>First Open</th>
+<th>Last Open</th>
 <th>First Click</th>
 <th>Last Click</th>
-
+<th>Possible Forward</th>
 <th>Action</th>
 </tr>
 </thead>
 <tbody>
 {% for r in rows %}
-<tr data-click="{{ 1 if (r['click_count'] or 0)>0 else 0 }}">
+<tr data-open="{{ 1 if (r['open_count'] or 0)>0 else 0 }}" data-click="{{ 1 if (r['click_count'] or 0)>0 else 0 }}">
 <td class="small">{{ r['campaign_id'] or 'legacy' }}</td>
 <td class="small">{{ r['tracking_id'] }}</td>
 <td>{{ r['recipient_name'] or '—' }}</td>
 <td>{{ r['recipient_email'] or r['recipient'] }}</td>
 <td class="small" style="max-width:360px;white-space:pre-wrap;word-break:break-word;">{{ r['message'] or '—' }}</td>
 <td class="small">{{ format_time(r['sent_at']) }}</td>
-<td>NOT OPENED</td>
-<td>{{ 'YES' if (r['click_count'] or 0)>0 else 'NO' }}</td>
+<td class="{{ 'yes' if (r['open_count'] or 0)>0 else 'no' }}">{{ 'YES' if (r['open_count'] or 0)>0 else 'NO' }}</td>
+<td>{{ r['open_count'] or 0 }}</td>
+<td class="{{ 'yes' if (r['click_count'] or 0)>0 else 'no' }}">{{ 'YES' if (r['click_count'] or 0)>0 else 'NO' }}</td>
 <td>{{ r['click_count'] or 0 }}</td>
+<td class="small">{{ format_time(r['first_opened_at']) }}</td>
+<td class="small">{{ format_time(r['last_opened_at']) }}</td>
 <td class="small">{{ format_time(r['first_clicked_at']) }}</td>
 <td class="small">{{ format_time(r['last_clicked_at']) }}</td>
+<td class="forward">{{ 'POSSIBLE' if (r['unique_open_signatures'] or 0)>1 else '—' }}</td>
 <td><form method="POST" action="/api/email/{{ r['tracking_id'] }}/delete" onsubmit="return confirm('Delete this email and ALL of its tracker activity/report data? This cannot be undone.');" style="margin:0;"><button type="submit" class="delete-btn">Delete</button></form></td>
 </tr>
 {% endfor %}
@@ -1853,9 +2001,12 @@ th{background:#f3f4f6;position:sticky;top:0;z-index:1}
 <script>
 function filterRows(kind){
   document.querySelectorAll('#reportTable tbody tr').forEach(row=>{
+    const opened=row.dataset.open==='1';
     const clicked=row.dataset.click==='1';
     let show =
       kind==='all' ||
+      (kind==='opened' && opened) ||
+      (kind==='not-opened' && !opened) ||
       (kind==='clicked' && clicked) ||
       (kind==='not-clicked' && !clicked);
     row.style.display=show?'':'none';
@@ -2163,14 +2314,14 @@ Public URL:
 
 <p>
 <a class="action" href="/report">📊 Full Campaign Report</a>
-<form method="POST" action="/api/emails/delete-all" onsubmit="return confirm('Delete ALL tracked emails, activity, form submissions and report data? This cannot be undone.');" style="display:inline;margin:0 0 0 8px;">
-<button class="action delete" type="submit">Delete All Activity</button>
-</form>
 </p>
 
 <p class="small">
 
-Open tracking is disabled because mailbox security scanners and privacy proxies can create false open signals.
+Open tracking is based on the tracking-image
+request. Email providers may preload images,
+so an open event is not guaranteed proof of
+manual reading.
 
 Click tracking is generated when the unique
 tracking URL is requested.
@@ -2285,6 +2436,10 @@ Sent
 </th>
 
 <th>
+Opens
+</th>
+
+<th>
 Clicks
 </th>
 
@@ -2325,6 +2480,16 @@ Actions
 <td class="time">
 
 {{ format_time(e["sent_at"]) }}
+
+</td>
+
+<td>
+
+<span class="badge">
+
+{{ e["open_count"] or 0 }}
+
+</span>
 
 </td>
 
@@ -2764,7 +2929,34 @@ Sent:
 {{ format_time(email["sent_at"]) }}
 
 <br>
-<strong>Clicks:</strong>
+
+<strong>
+Opens:
+</strong>
+
+{{ email["open_count"] or 0 }}
+
+<br>
+
+<strong>
+First Open:
+</strong>
+
+{{ format_time(email["first_opened_at"]) }}
+
+<br>
+
+<strong>
+Last Open:
+</strong>
+
+{{ format_time(email["last_opened_at"]) }}
+
+<br>
+
+<strong>
+Clicks:
+</strong>
 
 {{ email["click_count"] or 0 }}
 
@@ -2865,10 +3057,10 @@ Referer
 
 <td>
 
-{% if row["event"] == "not_opened" %}
+{% if row["event"] == "open" %}
 
 <span class="event event-open">
-NOT OPENED
+OPEN
 </span>
 
 {% elif row["event"] == "click" %}
