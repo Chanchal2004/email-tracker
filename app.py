@@ -2373,8 +2373,7 @@ Recipients
 
 <textarea
     name="recipients"
-    placeholder="Chanchal Chaudhary <chanchal@qhtalbros.com>
-Vishwjeet Singh <example@gmail.com>"
+    placeholder="Enter recipient name and email"
     required
 ></textarea>
 
