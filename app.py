@@ -956,8 +956,10 @@ def dashboard():
 @APP.post("/send")
 def send_from_dashboard():
 
-    names = request.form.getlist("recipient_name[]")
-    emails = request.form.getlist("recipient_email[]")
+    recipients_text = request.form.get(
+        "recipients",
+        ""
+    )
 
     subject = request.form.get(
         "subject",
@@ -969,48 +971,40 @@ def send_from_dashboard():
         ""
     ).strip()
 
-    recipient_details = []
+    raw_recipients = re.split(
+        r"[\n,;]+",
+        recipients_text
+    )
+
+    recipients = []
     invalid = []
-    seen = set()
 
-    # Name and email are entered as paired rows in the form.
-    # Every valid pair is stored with the tracking record so the
-    # report can always show who the message was sent to.
-    for index in range(max(len(names), len(emails))):
+    for item in raw_recipients:
 
-        name = names[index].strip() if index < len(names) else ""
-        email = emails[index].strip() if index < len(emails) else ""
+        email = item.strip()
 
-        if not name and not email:
+        if not email:
             continue
 
-        if not name:
-            invalid.append(email or "Recipient name missing")
-            continue
+        if valid_email(email):
 
-        if not email or not valid_email(email):
-            invalid.append(email or name)
-            continue
+            if email.lower() not in [
+                x.lower()
+                for x in recipients
+            ]:
+                recipients.append(email)
 
-        key = email.lower()
+        else:
+            invalid.append(item)
 
-        if key in seen:
-            continue
-
-        seen.add(key)
-
-        recipient_details.append({
-            "name": name,
-            "email": email
-        })
-
-    if not recipient_details:
+    if not recipients:
 
         return render_template_string(
             MESSAGE_HTML,
             title="Error",
             message=(
-                "Enter at least one recipient name and valid email address."
+                "At least one valid recipient "
+                "email required."
             ),
             back=True
         ), 400
@@ -1049,10 +1043,7 @@ def send_from_dashboard():
     results = []
     campaign_id = secrets.token_urlsafe(12)
 
-    for recipient_data in recipient_details:
-
-        recipient = recipient_data["email"]
-        recipient_name = recipient_data["name"]
+    for recipient in recipients:
 
         try:
 
@@ -1062,17 +1053,18 @@ def send_from_dashboard():
                 subject,
                 message,
                 campaign_id=campaign_id,
-                recipient_name=recipient_name
+                recipient_name=""
             )
 
-            results.append(result)
+            results.append(
+                result
+            )
 
         except Exception as e:
 
             results.append({
                 "success": False,
                 "recipient": recipient,
-                "recipient_name": recipient_name,
                 "error": str(e)
             })
 
@@ -1081,6 +1073,25 @@ def send_from_dashboard():
         results=results,
         invalid=invalid
     )
+
+
+# ============================================================
+# 1x1 GIF
+# ============================================================
+
+GIF_1X1 = (
+    b"GIF89a"
+    b"\x01\x00\x01\x00"
+    b"\x80\x00\x00"
+    b"\x00\x00\x00"
+    b"\xff\xff\xff"
+    b"!\xf9\x04\x01"
+    b"\x00\x00\x00\x00"
+    b",\x00\x00\x00\x00"
+    b"\x01\x00\x01\x00"
+    b"\x00\x02\x02"
+    b"D\x01\x00;"
+)
 
 
 # ============================================================
@@ -1727,13 +1738,29 @@ def get_emails():
 
 def _report_rows():
     conn = get_db()
+    # Dashboard Name:
+    # 1) use an explicitly stored recipient_name if present
+    # 2) otherwise use the latest name submitted by the recipient
+    #    through the tracked form for this tracking_id
     rows = conn.execute("""
         SELECT
             e.id,
             e.campaign_id,
             e.tracking_id,
             e.recipient,
-            e.recipient_name,
+            COALESCE(
+                NULLIF(e.recipient_name, ''),
+                (
+                    SELECT fs.name
+                    FROM form_submissions fs
+                    WHERE fs.tracking_id = e.tracking_id
+                      AND fs.name IS NOT NULL
+                      AND TRIM(fs.name) <> ''
+                    ORDER BY fs.id DESC
+                    LIMIT 1
+                ),
+                ''
+            ) AS display_name,
             e.recipient_email,
             e.subject,
             e.message,
@@ -1841,7 +1868,7 @@ def campaign_report_csv():
         writer.writerow([
             r["campaign_id"] or "legacy",
             r["tracking_id"],
-            r["recipient_name"] or "",
+            r["display_name"] or "",
             r["recipient_email"] or r["recipient"],
             r["subject"] or "",
             r["message"] or "",
@@ -1967,7 +1994,7 @@ th{background:#f3f4f6;position:sticky;top:0;z-index:1}
 <tr data-open="{{ 1 if (r['open_count'] or 0)>0 else 0 }}" data-click="{{ 1 if (r['click_count'] or 0)>0 else 0 }}">
 <td class="small">{{ r['campaign_id'] or 'legacy' }}</td>
 <td class="small">{{ r['tracking_id'] }}</td>
-<td>{{ r['recipient_name'] or '—' }}</td>
+<td>{{ r['display_name'] or '—' }}</td>
 <td>{{ r['recipient_email'] or r['recipient'] }}</td>
 <td class="small" style="max-width:360px;white-space:pre-wrap;word-break:break-word;">{{ r['message'] or '—' }}</td>
 <td class="small">{{ format_time(r['sent_at']) }}</td>
@@ -2343,47 +2370,19 @@ Send Email
 Recipients
 </label>
 
-<div id="recipient-list">
-
-<div class="recipient-row" style="display:grid;grid-template-columns:1fr 1fr auto;gap:10px;margin-bottom:10px;align-items:center;">
-
-<input
-    name="recipient_name[]"
-    type="text"
-    placeholder="Recipient name"
-    required
->
-
-<input
-    name="recipient_email[]"
-    type="email"
+<textarea
+    name="recipients"
     placeholder="username@gmail.com"
     required
->
-
-<button
-    type="button"
-    class="remove-recipient"
-    style="display:none;"
->
-Remove
-</button>
-
-</div>
-
-</div>
-
-<button
-    type="button"
-    id="add-recipient"
-    style="margin-bottom:14px;"
->
-+ Add Recipient
-</button>
+></textarea>
 
 <p class="small">
-Enter the recipient's name and email separately.
-The name entered here is saved with the tracking record and shown in the dashboard.
+
+One recipient per line, or use commas/semicolons.
+Enter only the recipient email address.
+The Name column is filled from the name submitted by the recipient
+through the tracked activity form, when available.
+
 </p>
 
 
@@ -2417,48 +2416,6 @@ Message
 Send Email
 
 </button>
-
-<script>
-(function () {
-    const list = document.getElementById("recipient-list");
-    const addButton = document.getElementById("add-recipient");
-
-    if (!list || !addButton) return;
-
-    function updateRemoveButtons() {
-        const rows = list.querySelectorAll(".recipient-row");
-        rows.forEach(function (row) {
-            const button = row.querySelector(".remove-recipient");
-            if (button) {
-                button.style.display = rows.length > 1 ? "inline-block" : "none";
-            }
-        });
-    }
-
-    addButton.addEventListener("click", function () {
-        const row = document.createElement("div");
-        row.className = "recipient-row";
-        row.style.cssText = "display:grid;grid-template-columns:1fr 1fr auto;gap:10px;margin-bottom:10px;align-items:center;";
-        row.innerHTML = `
-            <input name="recipient_name[]" type="text" placeholder="Recipient name" required>
-            <input name="recipient_email[]" type="email" placeholder="username@gmail.com" required>
-            <button type="button" class="remove-recipient">Remove</button>
-        `;
-        list.appendChild(row);
-        updateRemoveButtons();
-    });
-
-    list.addEventListener("click", function (event) {
-        if (event.target.classList.contains("remove-recipient")) {
-            const row = event.target.closest(".recipient-row");
-            if (row) row.remove();
-            updateRemoveButtons();
-        }
-    });
-
-    updateRemoveButtons();
-})();
-</script>
 
 </form>
 
