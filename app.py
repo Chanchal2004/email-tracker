@@ -1,3 +1,6 @@
+
+
+
 import os
 import re
 import psycopg2
@@ -11,6 +14,7 @@ import io
 
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
+from email.utils import parseaddr
 from html import escape
 from urllib.parse import urlparse
 
@@ -836,7 +840,10 @@ def send_one_email(
 
     msg = EmailMessage()
 
-    msg["To"] = recipient
+    if recipient_name:
+        msg["To"] = f"{recipient_name} <{recipient}>"
+    else:
+        msg["To"] = recipient
 
     msg["From"] = SENDER_EMAIL
 
@@ -970,16 +977,23 @@ def send_from_dashboard():
     )
 
     recipients = []
-
+    recipient_details = []
     invalid = []
 
     for item in raw_recipients:
 
-        email = item.strip()
+        item = item.strip()
+
+        if not item:
+            continue
+
+        name, email = parseaddr(item)
+        name = name.strip()
+        email = email.strip()
 
         if not email:
-
-            continue
+            email = item
+            name = ""
 
         if valid_email(email):
 
@@ -987,16 +1001,14 @@ def send_from_dashboard():
                 x.lower()
                 for x in recipients
             ]:
-
-                recipients.append(
-                    email
-                )
+                recipients.append(email)
+                recipient_details.append({
+                    "name": name,
+                    "email": email
+                })
 
         else:
-
-            invalid.append(
-                email
-            )
+            invalid.append(item)
 
     if not recipients:
 
@@ -1044,7 +1056,10 @@ def send_from_dashboard():
     results = []
     campaign_id = secrets.token_urlsafe(12)
 
-    for recipient in recipients:
+    for recipient_data in recipient_details:
+
+        recipient = recipient_data["email"]
+        recipient_name = recipient_data["name"]
 
         try:
 
@@ -1053,7 +1068,8 @@ def send_from_dashboard():
                 recipient,
                 subject,
                 message,
-                campaign_id=campaign_id
+                campaign_id=campaign_id,
+                recipient_name=recipient_name
             )
 
             results.append(
@@ -1065,6 +1081,7 @@ def send_from_dashboard():
             results.append({
                 "success": False,
                 "recipient": recipient,
+                "recipient_name": recipient_name,
                 "error": str(e)
             })
 
@@ -1919,7 +1936,7 @@ th{background:#f3f4f6;position:sticky;top:0;z-index:1}
 <body>
 <div class="wrap">
 <h1>Email Campaign Report</h1>
-<div class="muted">One screen: every sent email, opened/not opened, clicked/not clicked, activity and download.</div>
+<div class="muted">One screen: every sent email, observed open/not-open event, clicked/not clicked, activity and download.</div>
 
 <div class="top">
 <a class="btn" href="/">← Dashboard</a>
@@ -1940,7 +1957,7 @@ th{background:#f3f4f6;position:sticky;top:0;z-index:1}
 <div class="bar"><div class="fill" style="width:{{ open_rate }}%"></div></div>
 <strong>Click rate — {{ click_rate }}%</strong>
 <div class="bar"><div class="fill" style="width:{{ click_rate }}%"></div></div>
-<div class="small">Forwarding cannot be directly confirmed by Gmail/Outlook. “Possible” is only a heuristic based on different observed tracking signatures.</div>
+<div class="small">Open tracking is based on a tracking-pixel request observed by the server. Email providers may preload or proxy images, so an observed open is not guaranteed proof that a human manually opened the message. “Possible” forwarding is only a heuristic based on different observed tracking signatures.</div>
 </div>
 
 <div class="controls">
@@ -2356,15 +2373,16 @@ Recipients
 
 <textarea
     name="recipients"
-    placeholder="user1@example.com
-user2@example.com
-user3@example.com"
+    placeholder="Chanchal Chaudhary <chanchal@qhtalbros.com>
+Vishwjeet Singh <example@gmail.com>"
     required
 ></textarea>
 
 <p class="small">
 
-One recipient per line, or use commas.
+One recipient per line, or use commas/semicolons.
+Use <b>Name &lt;email@example.com&gt;</b> to save the recipient name.
+A plain email address is also accepted.
 
 </p>
 
@@ -4102,4 +4120,3 @@ if __name__ == "__main__":
         debug=False,
         threaded=True
     )
-    
